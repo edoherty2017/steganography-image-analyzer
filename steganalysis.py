@@ -1,51 +1,62 @@
-# steganalysis.py
+
 import argparse
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
-def analyze(image_path, output_path=None):
-    """Analyzes an image and generates color histograms."""
+def analyze_comparison(original_image_path, encoded_image_path, output_path=None):
+    """
+    Generates a 2x2 comparison plot showing both standard histograms and
+    difference analysis for an original and encoded image.
+    """
     try:
-        image = Image.open(image_path).convert("RGB")
+        original_image = Image.open(original_image_path).convert("RGB")
+        encoded_image = Image.open(encoded_image_path).convert("RGB")
     except FileNotFoundError:
-        print(f"Error: Image file not found at {image_path}")
+        print("Error: One or both image files not found.")
         return
 
-    np_image = np.array(image)
+    np_orig = np.array(original_image)
+    np_enc = np.array(encoded_image)
+
+    fig, axs = plt.subplots(2, 2, figsize=(20, 18))
+    fig.suptitle("Comprehensive Steganalysis: Before vs. After (Blue Channel)", fontsize=24)
+
+    def plot_standard_hist(ax, channel_data, color, title):
+        ax.hist(channel_data, bins=256, color=color, alpha=0.7)
+        ax.set_title(title, fontsize=16)
+        ax.set_xlabel("Pixel Value (0-255)", fontsize=12)
+        ax.set_ylabel("Frequency (Number of Pixels)", fontsize=12)
+        ax.set_xlim([0, 255])
+
+    def plot_difference_hist(ax, channel_data, color, title):
+        hist, _ = np.histogram(channel_data, bins=256, range=(0, 256))
+        differences = [float(hist[i]) - float(hist[i+1]) for i in range(0, 255, 2)]
+        ax.hist(differences, bins=50, color=color, alpha=0.7)
+        ax.set_title(title, fontsize=16)
+        ax.set_xlabel("Difference between Adjacent Color Pair Counts", fontsize=12)
+        ax.set_ylabel("Frequency of that Difference", fontsize=12)
+
+    # --- Plotting Data (using Blue channel for clarity) ---
+    plot_standard_hist(axs[0, 0], np_orig[:, :, 2].flatten(), 'blue', "1. Original Image: Standard Histogram")
+    plot_standard_hist(axs[0, 1], np_enc[:, :, 2].flatten(), 'blue', "2. Encoded Image: Standard Histogram")
+    plot_difference_hist(axs[1, 0], np_orig[:, :, 2].flatten(), 'purple', "3. Original Image: Difference Analysis")
+    plot_difference_hist(axs[1, 1], np_enc[:, :, 2].flatten(), 'purple', "4. Encoded Image: Difference Analysis (The 'Smoking Gun')")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     
-    r_channel = np_image[:, :, 0].flatten()
-    g_channel = np_image[:, :, 1].flatten()
-    b_channel = np_image[:, :, 2].flatten()
-    
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 15))
-    fig.suptitle(f'Color Histograms for {image_path}', fontsize=16)
-
-    ax1.hist(r_channel, bins=256, color='red', alpha=0.7)
-    ax1.set_title('Red Channel')
-    ax1.set_xlim([0, 255])
-
-    ax2.hist(g_channel, bins=256, color='green', alpha=0.7)
-    ax2.set_title('Green Channel')
-    ax2.set_xlim([0, 255])
-
-    ax3.hist(b_channel, bins=256, color='blue', alpha=0.7)
-    ax3.set_title('Blue Channel')
-    ax3.set_xlim([0, 255])
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-    
-    # If an output path is provided, save the figure. Otherwise, display it.
     if output_path:
-        plt.savefig(output_path)
-        print(f"Histogram saved to {output_path}")
+        plt.savefig(output_path, dpi=150)
+        plt.close()
     else:
         plt.show()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Image Histogram Analysis Tool")
-    parser.add_argument("-i", "--image", required=True, help="Path to the input image.")
-    parser.add_argument("-o", "--output", help="Optional: Path to save the histogram plot image.")
+    parser = argparse.ArgumentParser(description="Comprehensive Steganalysis Tool")
+    parser.add_argument("--original", required=True, help="Path to the original image.")
+    parser.add_argument("--encoded", required=True, help="Path to the encoded image.")
+    parser.add_argument("-o", "--output", help="Optional: Path to save the analysis plot.")
     args = parser.parse_args()
     
-    analyze(image_path=args.image, output_path=args.output)
+    analyze_comparison(args.original, args.encoded, args.output)
