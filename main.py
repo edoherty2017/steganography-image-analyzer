@@ -1,5 +1,6 @@
 # main.py
 import argparse
+from encoder import encode
 
 def main():
     parser = argparse.ArgumentParser(description="A tool for LSB steganography.")
@@ -17,9 +18,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Placeholder logic
     if args.command == "encode":
-        print("Encoding command called...")
+        # Call the encode function from our encoder module
+        encode(image_path=args.image, message=args.message, output_path=args.output)
     elif args.command == "decode":
         print("Decoding command called...")
 
