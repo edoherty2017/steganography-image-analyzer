@@ -1,6 +1,7 @@
 # main.py
 import argparse
 from encoder import encode
+from decoder import decode
 
 def main():
     parser = argparse.ArgumentParser(description="A tool for LSB steganography.")
@@ -19,10 +20,13 @@ def main():
     args = parser.parse_args()
 
     if args.command == "encode":
-        # Call the encode function from our encoder module
         encode(image_path=args.image, message=args.message, output_path=args.output)
     elif args.command == "decode":
-        print("Decoding command called...")
+        # Call the decode function and print the result if successful
+        message = decode(image_path=args.image)
+        if message:
+            print("Decoded Message Found:")
+            print(message)
 
 if __name__ == "__main__":
     main()
