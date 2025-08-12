@@ -1,17 +1,3 @@
-"""
-Steganography Analysis Tool — Minimal ttk UI with Tabs (No Scrollbars)
-
-Drop this file next to your existing `encoder.py`, `decoder.py`, and `steganalysis.py`.
-Requires: tkinter (built-in), Pillow (PIL)
-
-Highlights:
-- Clean ttk layout, resizable window
-- Tabs for Original/Resized, Encoded, and Analysis (no scrollbars anywhere)
-- Each tab auto-fits the image to the available space on resize
-- Message box with live Remaining counter (no visible scrollbar)
-- Simple toolbar and status bar
-"""
-
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox

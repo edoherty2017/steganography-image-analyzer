@@ -1,0 +1,25 @@
+{
+  "tag": "20250811-171038_full-low",
+  "channel": "B",
+  "cover": {
+    "file": "stego.png",
+    "L1": 19786,
+    "L2": 8715.806560496854,
+    "median_abs": 60.0,
+    "max_abs": 8605,
+    "max_k": 0
+  },
+  "stego": {
+    "file": "stego_20250811-171038_full-low_enc.png",
+    "L1": 19792,
+    "L2": 8716.1571807764,
+    "median_abs": 60.0,
+    "max_abs": 8605,
+    "max_k": 0
+  },
+  "delta": {
+    "L1_drop": -6,
+    "L2_drop": -0.3506202795451827,
+    "median_abs_drop": 0.0
+  }
+}
