@@ -2652,7 +2652,9 @@ class SteganoApp:
     def _build_menu(self):
         """Create the File and Help menus and bind the Open shortcut."""
         aqua = self.root.tk.call("tk", "windowingsystem") == "aqua"
-        menubar = tk.Menu(self.root)
+        # tearoff=False here too: on X11 a menu's entry 0 is otherwise a
+        # dashed tear-off line, which has no label.
+        menubar = tk.Menu(self.root, tearoff=False)
         filemenu = tk.Menu(menubar, tearoff=False)
         filemenu.add_command(label="Open…", command=self.open_file,
                              accelerator="Command-O" if aqua else "Ctrl+O")
