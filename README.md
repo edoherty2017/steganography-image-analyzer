@@ -59,9 +59,11 @@ Every figure below was produced by this repository's own code.
 
 ![Detection curves for every detector and payload variant](results/experiments/detection-demo/detection_combined.png)
 
-**The visual attack works on clean graphics.** Bit planes of a noise-free, computer-generated 512x384 picture after 20,000 random bytes (27% of capacity) were hidden in natural order. In the bit 0 column (right) the payload is the noisy band across the top; below it, the LSB plane still shows the picture's smooth gradient stripes.
+**The visual attack works on clean graphics.** Bit planes of a noise-free, computer-generated 512x384 picture ([`docs/figures/flat_cover.png`](docs/figures/flat_cover.png)) after 20,000 random bytes (27% of capacity) were hidden in natural order. In the bit 0 column (right) the payload is the noisy band across the top; below it, the LSB plane still shows the picture's smooth gradient stripes.
 
 ![Bit-plane grid: a noisy band at the top of the LSB plane](docs/figures/visual_attack_bitplanes.png)
+
+To redo it: `head -c 20000 /dev/urandom > blob.bin`, then `python main.py encode -i docs/figures/flat_cover.png -f blob.bin -o flat_stego.png` and `python main.py bitplanes -i flat_stego.png -o planes.png`.
 
 **It fails on photos.** The same kind of payload (50% of capacity, encrypted, natural order) in a 400x267 photo (`results/stego_resized.png`). The photo's own sensor noise already makes bits 0 to 3 look random, so the bit planes (left) show nothing. With the original cover at hand, the LSB difference mask (right, white = changed) shows exactly where the payload went: the top half. Without the cover, the statistical detectors are needed.
 
@@ -101,7 +103,7 @@ pip install -r requirements.txt    # or requirements-dev.txt to also get pytest
 
 ## Quick start
 
-The commands below were run exactly as shown. They use a scratch folder and the clean 400x267 photo committed as `results/stego_resized.png`:
+The commands below were run as shown, and the outputs are copied from those runs (`...` marks lines left out); the one exception is `--tag my-run` under Experiments, which writes into `results/`. They use a scratch folder and the clean 400x267 photo committed as `results/stego_resized.png`:
 
 ```bash
 mkdir -p demo && cp results/stego_resized.png demo/cover.png && cd demo
@@ -346,7 +348,7 @@ Report formats: md, json, html
 ### Experiments
 
 ```bash
-python ../make_all.py detection --quick --out /tmp/exp       # two 128 px synthetic covers, 4 rates (about 3 s)
+python ../make_all.py detection --quick --out /tmp/exp       # two 128 px synthetic covers, 4 rates (about 3 s), into /tmp/exp/detection-<timestamp>/
 python ../make_all.py detection --tag my-run                 # the full run (about 8 s), into results/experiments/my-run/
 python ../make_all.py classic cover.png --out classic/        # the original three histogram cases
 ```
@@ -620,7 +622,7 @@ After `import ones_detector`, `detectors.run_all(image)` includes it and `detect
 | `make_all.py` | Experiment runner: `detection` curves and the `classic` three-case histogram experiment. |
 | `tests/` | The pytest suite (`conftest.py` holds shared fixtures). |
 | `results/` | Committed outputs: the original experiment (run `20250811-171038`), GUI outputs and stego images in the original format, and `experiments/detection-demo/`. |
-| `docs/` | `ARCHITECTURE.md` (module diagram, data flow, registries) and `figures/` (README figures). |
+| `docs/` | `ARCHITECTURE.md` (module diagram, data flow, registries) and `figures/` (README figures and the noise-free test graphic `flat_cover.png`). |
 | `requirements.txt`, `requirements-dev.txt` | Runtime and test dependencies. |
 | `pyproject.toml` | Package metadata, the `stego-analyzer` command and the pytest settings. |
 | `.github/workflows/tests.yml` | Runs the tests on Ubuntu for Python 3.11, 3.12 and 3.13. |
