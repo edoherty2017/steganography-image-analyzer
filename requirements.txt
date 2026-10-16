@@ -1,0 +1,14 @@
+# Runtime dependencies of the Steganography Image Analyzer.
+# Tested with numpy 2.5.4, Pillow 12.3.0, matplotlib 3.11.2, scipy 1.18.1 and
+# cryptography 50.0.2 on Python 3.13.7 (macOS).
+# tkinter (used only by gui.py) is part of the Python standard library and is
+# not installed with pip; see "Install" in README.md.
+# Test-only packages are in requirements-dev.txt.
+numpy
+# gui.py uses Image.Resampling, which first appeared in Pillow 9.1.
+pillow>=9.1
+matplotlib
+# Chi-square and randomness detectors (scipy.stats.chi2).
+scipy
+# AES-256-GCM encryption and the scrypt key derivation in payload.py.
+cryptography
