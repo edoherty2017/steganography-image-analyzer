@@ -1,6 +1,23 @@
+# Python environments and caches
 .venv/
+venv/
 __pycache__/
-test-images/
-.DS_Store
-.claude/
 *.pyc
+.pytest_cache/
+
+# Packaging artifacts (pip install . / pip wheel .)
+build/
+dist/
+*.egg-info/
+
+# Local scratch space and editor/agent folders
+.scratch/
+.claude/
+.DS_Store
+
+# Personal test images (not redistributable); tests skip when they are missing
+test-images/
+
+# Raw stego images from `make_all.py detection --keep-images`. The CSV, JSON,
+# LaTeX table and figures in results/experiments/<tag>/ stay committed.
+results/experiments/*/stego/

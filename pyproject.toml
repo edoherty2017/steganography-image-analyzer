@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steganography-image-analyzer"
+version = "1.0.0"
+description = "Hide, reveal and detect LSB steganography in images and WAV audio: payload recovery, bit-plane views, brute-force decoding and blind steganalysis (chi-square, SPA, RS)."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Ethan Doherty" }]
+# No license has been chosen yet (see README.md, "License").
+keywords = ["steganography", "steganalysis", "lsb", "chi-square", "rs-analysis", "tkinter"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Environment :: X11 Applications :: Tk",
+    "Environment :: Console",
+    "Topic :: Security",
+    "Topic :: Multimedia :: Graphics",
+]
+# Keep in step with requirements.txt.
+dependencies = [
+    "numpy",
+    "pillow>=9.1",
+    "matplotlib",
+    "scipy",
+    "cryptography",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/edoherty2017/steganography-image-analyzer"
+
+[project.scripts]
+# main.main(argv=None) parses sys.argv and returns the exit status.
+stego-analyzer = "main:main"
+
+[tool.setuptools]
+# The project is a set of flat top-level modules plus two plug-in packages,
+# so automatic discovery is turned off and everything is listed here.
+py-modules = [
+    "bitplanes",
+    "bitutils",
+    "bruteforce",
+    "decoder",
+    "encoder",
+    "gui",
+    "main",
+    "make_all",
+    "pairwise_stats",
+    "payload",
+    "report",
+    "steganalysis",
+    "stego",
+]
+packages = ["carriers", "detectors"]
+
+[tool.pytest.ini_options]
+# Lets a bare `pytest` import the flat modules, as `python -m pytest` does.
+pythonpath = ["."]
+testpaths = ["tests"]
