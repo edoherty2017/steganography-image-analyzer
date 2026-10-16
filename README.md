@@ -49,7 +49,7 @@ It comes as a Tkinter desktop app (`gui.py`), a command line (`main.py`) and a s
 | **Reports**: one-image analysis as a terminal summary, Markdown (with figures), self-contained HTML, or JSON. | `report.py` |
 | **Experiments**: detection curves for every detector across embedding rates, with CSV, JSON, LaTeX and figures. | `make_all.py` |
 | **Three front ends**: Tkinter desktop app, command line, Python API. Pure Python, so it runs wherever Python 3.11+ and Tk run. Developed on macOS; a GitHub Actions workflow runs the test suite on Ubuntu; Windows has not been tested. | `gui.py`, `main.py` |
-| **482 automated tests.** | `tests/` |
+| **716 automated tests.** | `tests/` |
 
 ## Figures
 
@@ -155,9 +155,11 @@ main.py: error: no STGA payload found in 'secret.png' at 1 or 2 bits per sample;
 ### Hide a file, with compression, at 2 bits per sample
 
 ```console
+$ python -c "open('notes.txt', 'wb').write(b'These are my notes.\n' * 43)"
+
 $ python ../main.py encode -i cover.png -f notes.txt -o filestego.png --compress --bits 2
 Successfully hid file 'notes.txt' in 'filestego.png'
-  860 bytes of data in a 84-byte frame, 0.10% of capacity (image-lsb, 2 bit(s)/sample, not encrypted, sequential, compressed)
+  860 bytes of data in a 57-byte frame, 0.07% of capacity (image-lsb, 2 bit(s)/sample, not encrypted, sequential, compressed)
 
 $ python ../main.py decode -i filestego.png
 Hidden file found: 'notes.txt' (860 bytes). Use --out DIR to save it.
@@ -166,7 +168,7 @@ $ python ../main.py decode -i filestego.png --out recovered/
 Saved 860 bytes to 'recovered/notes.txt'
 ```
 
-Any file works; `notes.txt` here is 860 bytes of repeated text, which compresses to a 70-byte body. `decode` never prints binary data. `--out DIR/` (or an existing folder) keeps the stored file name and never overwrites; any other `--out PATH` is written exactly there.
+Any file works; the first command writes `notes.txt` as 860 bytes of repeated text (binary mode, so the size is the same on every platform), which compresses to a 43-byte body. `decode` never prints binary data. `--out DIR/` (or an existing folder) keeps the stored file name and never overwrites; any other `--out PATH` is written exactly there.
 
 ### Audio carrier (WAV)
 
@@ -188,7 +190,7 @@ Stego images written by the first version of this project (text followed by 64 z
 
 ```console
 $ python ../main.py decode -i ../results/stego_encoded.png
-note: no STGA frame; read the legacy delimiter format (text followed by 64 zero bits)
+note: no STGA frame; read the legacy delimiter format (text followed by 64 zero bits), heuristic text score 0.86
 Decoded Message Found:
 I am a sneaky dino!! Knowbody knows im here!!
 ```
@@ -245,21 +247,21 @@ $ python ../main.py analyze -i half.png --no-bruteforce
 Image:    half.png (PNG, RGB, 400x267)
 Capacity: 40,036 bytes at 1 bit/sample, 80,086 at 2
 Verdict:  LIKELY STEGO (score 1.00, driven by sample_pair_analysis)
-          Estimated LSB embedding rate 57.3% (channel B); mean over channels 52.9%.
+          Estimated LSB embedding rate 50.8% (channel B); mean over channels 49.2%.
 Payload:  none found in natural order (a password-scattered payload needs its password)
 
 Detectors:
   signatures             clean         0.00  No payload header, file signature or readable text in the LSB streams.
   chi_square             clean         0.00  Inconclusive: the histogram is so smooth that even the control pairs are balanced, so the chi-square attack cannot separate payload from cover here.
-  sample_pair_analysis   likely_stego  1.00  Estimated LSB embedding rate 57.3% (channel B); mean over channels 52.9%.
-  rs_analysis            likely_stego  1.00  Estimated LSB embedding rate 59.6% (channel B); mean over channels 54.0%.
-  histogram_pairs        likely_stego  0.98  Even/odd pairs are flattened (ratio 0.11, channel G); consistent with LSB replacement by random-looking (encrypted or compressed) bits.
+  sample_pair_analysis   likely_stego  1.00  Estimated LSB embedding rate 50.8% (channel B); mean over channels 49.2%.
+  rs_analysis            likely_stego  1.00  Estimated LSB embedding rate 51.0% (channel G); mean over channels 50.0%.
+  histogram_pairs        suspicious    0.43  Even/odd pairs are flattened (ratio 0.34, channel G); consistent with LSB replacement by random-looking (encrypted or compressed) bits.
   lsb_randomness         clean         0.30  LSB plane is statistically random: typical of a noisy photo, and also what an encrypted or compressed payload looks like; not evidence on its own.
 
 Scores are heuristics, not probabilities; see report.py.
 ```
 
-The payload cannot be read without the password, but sample pair analysis and RS analysis both measure it: a mean rate of 53% and 54% against the true 50%. With the password, `analyze --password-prompt` also decrypts it.
+The payload cannot be read without the password, but sample pair analysis and RS analysis both measure it: a mean rate of 49% and 50% against the true 50%. (The payload is random, so these numbers and the histogram-pairs score change from run to run; in repeated runs the histogram-pairs score ranged from 0.43 to 1.00.) With the password, `analyze --password-prompt` also decrypts it.
 
 Reports and JSON:
 
@@ -280,7 +282,7 @@ Markdown and HTML reports include a bit-plane grid, an amplified-LSB image and t
 $ python ../main.py bitplanes -i half.png -o planes.png --diff cover.png --amplify lsb.png
 Bit-plane grid written to 'planes.png'
 Amplified LSB image written to 'lsb.png'
-LSB diff written to 'planes_lsb_diff.png': 61,989 of 106,800 pixels (58.04%) have a changed LSB
+LSB diff written to 'planes_lsb_diff.png': 61,677 of 106,800 pixels (57.75%) have a changed LSB
 ```
 
 `--channels RGBA` adds the alpha row when the image has one.
@@ -304,7 +306,7 @@ A payload scattered with a password looks like noise in every layout. `--wordlis
 $ printf 'password\nletmein\ncorrect horse\ndragon\n' > words.txt
 $ python ../main.py bruteforce -i secret.png --top 1 --wordlist words.txt
 score  layout                     kind       preview
- 0.00  RGB bit0 msb-first row     binary     binary, entropy 7.95 bits/byte: d5 0f e1 fb 83 71 72 ae f0 54 0f 5a dd 36 7d 71 ...
+ 0.21  RGB bits1-0 lsb-first col  text       @1307: f9[,n<j2sU@}Btzhr
 wordlist: password 'correct horse' (1 bit/sample): The key is under the mat.
 ```
 
@@ -321,8 +323,8 @@ Comparison figure written to 'plots/comparison.png'
   also 'plots/4_encoded_difference_analysis.png'
 Even/odd pair statistics, blue channel (Delta_k = h(2k) - h(2k+1)):
   cover: L1 3,184  L2 540.6  median |Delta| 17  max |Delta| 429 at k=0
-  stego: L1 2,928  L2 382.7  median |Delta| 15  max |Delta| 147 at k=0
-61,989 of 106,800 pixels (58.04%) have a changed R, G or B LSB
+  stego: L1 2,752  L2 359.0  median |Delta| 15  max |Delta| 175 at k=0
+61,677 of 106,800 pixels (57.75%) have a changed R, G or B LSB
 ```
 
 `--channel r|g|b` picks the channel (default `b`).
@@ -416,19 +418,19 @@ Everything that is hidden is wrapped in a self-describing frame: a 14-byte big-e
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | Magic `STGA` |
-| 4 | 1 | Version (1) |
+| 4 | 1 | Version (2) |
 | 5 | 1 | Flags: `0x01` encrypted, `0x02` file, `0x04` compressed. Any other bit makes the header invalid. |
 | 6 | 4 | Body length (uint32) |
-| 10 | 4 | CRC-32 of the body (`zlib.crc32`) |
+| 10 | 4 | CRC-32 (`zlib.crc32`) of header bytes 0 to 9 followed by the body |
 | 14 | n | Body |
 
 The body is built in three steps, so a file name is hidden by compression and encryption too:
 
 1. If a file name is given, the record starts with a 2-byte name length and the UTF-8 name (directories are stripped), followed by the data.
 2. If compression is requested, the record is zlib-compressed.
-3. If a password is given, the record is encrypted with AES-256-GCM. The key comes from scrypt (n = 2^14, r = 8, p = 1, a random 16-byte salt, 32-byte key). The encrypted body is `salt (16) | nonce (12) | ciphertext + tag (16)`, so encryption adds exactly 44 bytes.
+3. If a password is given, the record is encrypted with AES-256-GCM. The key comes from scrypt (n = 2^14, r = 8, p = 1, a random 16-byte salt, 32-byte key). The first 10 header bytes (magic, version, flags, body length) are passed to GCM as associated data, so the tag also covers the flags and the length. The encrypted body is `salt (16) | nonce (12) | ciphertext + tag (16)`, so encryption adds exactly 44 bytes.
 
-On the way back, the CRC is checked before decryption, so a damaged image (`PayloadError`) and a wrong password (`WrongPasswordError`) give different errors. The CRC only detects accidental damage; the GCM tag is what protects an encrypted frame against tampering. Decompression is capped at 256 MiB.
+On the way back, the CRC is checked before decryption, so a damaged image (`PayloadError`) and a wrong password (`WrongPasswordError`) give different errors. The CRC only detects accidental damage; the GCM tag is what protects an encrypted frame against tampering. Because the CRC covers the flags and the length as well as the body, one flipped header bit is caught instead of changing how the body is decoded. Decompression is capped at 16 MiB. Frames of version 1 (a development format whose CRC covered only the body) are rejected by `payload.unpack`; the signature scan and brute force still recognize them.
 
 The frame replaces the original format, which stored `ord()` codes followed by 64 zero bits. That format could not hold binary data or text with NUL characters, broke on characters above U+00FF, and cut off messages whose last character ended in zero bits (`"abcd"` came back as `"abc"`). The old images are still readable (`decoder.decode_legacy`, which searches for the marker only at byte boundaries).
 
@@ -534,6 +536,8 @@ What this shows, on these 3 covers only:
 
 This is a demonstration on three covers, not an evaluation. A real one would need hundreds of photos (for example a public steganalysis database) and ROC curves.
 
+The committed run predates the last calibration changes to the detectors: `detectors.combine_results` no longer adds a bonus when SPA and RS agree (the two estimators are correlated, so it counted the same evidence twice). Re-running with the current code gives the same "smallest rate flagged" table and estimate errors within 0.02, but Overall scores at 25% about 0.1 lower (0.76 instead of 0.86 for random-sequential) and other cells that move by up to 0.1 (the encrypted rows also vary between runs).
+
 The original three-case experiment is still available as `make_all.py classic` and its committed outputs are in `results/` (run `20250811-171038`). In short: a 54-character message in an 800x534 image moved the blue channel's pair L1 norm by 6 out of 19,786, while filling the image to capacity with text raised it to 36,924, the "comb" effect.
 
 ## Writing a plug-in
@@ -636,7 +640,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q tests        # or just: pytest
 ```
 
-482 tests, about 40 seconds. They cover the frame format (including tampering, truncation and wrong passwords), every carrier at 1 and 2 bits per sample with and without scatter, the hide/reveal API, the original-format compatibility (including the committed stego images in `results/`), each detector's calibration on synthetic covers, brute force, bit planes, reports, every CLI subcommand (run as subprocesses), the experiment runner and the GUI. Tests write their files to pytest's temporary folders, not into the repository.
+716 tests, about 75 seconds. They cover the frame format (including tampering, truncation and wrong passwords), every carrier at 1 and 2 bits per sample with and without scatter, the hide/reveal API, the original-format compatibility (including the committed stego images in `results/`), each detector's calibration on synthetic covers, brute force, bit planes, reports, every CLI subcommand (run as subprocesses), the experiment runner and the GUI. Tests write their files to pytest's temporary folders, not into the repository.
 
 Some tests skip themselves:
 
@@ -662,7 +666,7 @@ Some tests skip themselves:
 
 **Other**
 
-- Key scatter is obfuscation, not extra security. The scrypt parameters are fixed in version 1 of the frame.
+- Key scatter is obfuscation, not extra security. The scrypt parameters are fixed in version 2 of the frame.
 - The original delimiter format cannot hold trailing NUL characters or runs of 8 or more NULs; the new frame can.
 - `steganalysis.analyze_comparison` titles its four single plots "(Blue Channel)" even when another channel is chosen (the composite figure is labeled correctly).
 - The `20250811-171038_*` figures in `results/` were made by an earlier version of `steganalysis.py`, so their titles and axis labels differ from what it draws today. `results/pairwise_stats_full._maxwords.tex` is a stray file.

@@ -89,7 +89,7 @@ sequenceDiagram
     S-->>C: summary dict (sizes, utilization, flags)
 ```
 
-Inside `payload.pack` the body is built as: optional file-name record, then optional zlib, then optional AES-256-GCM (scrypt key, random salt and nonce). The header holds the magic `STGA`, the version, the flags, the body length and the body's CRC-32.
+Inside `payload.pack` the body is built as: optional file-name record, then optional zlib, then optional AES-256-GCM (scrypt key, random salt and nonce). The header holds the magic `STGA`, the version (2), the flags, the body length and a CRC-32 over the first 10 header bytes followed by the body; those 10 bytes are also the GCM associated data.
 
 Inside `Carrier.embed` the sample positions are `arange(n)` without a key, or the first `n` entries of a PCG64 permutation seeded from SHA-256(key) with one. Only the lowest `bits_per_sample` bits of each used sample change.
 
@@ -193,4 +193,4 @@ Tk is not thread-safe, so `gui.py` keeps all widget work on the Tk thread. `Steg
 
 ## Tests
 
-`tests/` mirrors the modules (`test_payload.py`, `test_carriers.py`, `test_stego.py`, `test_detectors.py`, `test_bruteforce.py`, `test_bitplanes.py`, `test_report.py`, `test_cli.py`, `test_gui.py`, `test_experiments.py`, `test_legacy.py`, `test_bitutils.py`). Shared fixtures are in `tests/conftest.py`: `synthetic_rgb(seed, size)` builds a smooth, mildly noisy RGB cover, and `save_png` writes arrays into the test's temporary folder. The CLI tests run `main.py` as a subprocess; the GUI tests build a hidden Tk root and skip when no display is available. `pyproject.toml` sets `pythonpath = ["."]` and `testpaths = ["tests"]`, so both `pytest` and `python -m pytest` work from the repository root.
+`tests/` mirrors the modules (`test_payload.py`, `test_carriers.py`, `test_stego.py`, `test_detectors.py`, `test_bruteforce.py`, `test_bitplanes.py`, `test_report.py`, `test_cli.py`, `test_gui.py`, `test_experiments.py`, `test_legacy.py`, `test_bitutils.py`), plus `test_detectors_init.py` (registry and score combination), `test_rate_estimators.py` (SPA/RS rate estimates), `test_steganalysis.py` (histogram comparison), `test_results_tables.py` (committed LaTeX tables) and `test_readme.py` (the README quick start). Shared fixtures are in `tests/conftest.py`: `synthetic_rgb(seed, size)` builds a smooth, mildly noisy RGB cover, and `save_png` writes arrays into the test's temporary folder. The CLI tests run `main.py` as a subprocess; the GUI tests build a hidden Tk root and skip when no display is available. `pyproject.toml` sets `pythonpath = ["."]` and `testpaths = ["tests"]`, so both `pytest` and `python -m pytest` work from the repository root.
