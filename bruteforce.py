@@ -39,6 +39,12 @@ and the score is a ranking confidence in [0, 1], not a probability:
                 depend on payload.py.
     0.97        A known file signature (PNG, JPEG, GIF, ZIP, PDF, GZIP, BMP,
                 RIFF/WAV) whose internal structure was walked to its end.
+                A PDF can contain "%%EOF" more than once (incremental
+                updates, the first-page trailer of a linearized file), so
+                its end is the last "%%EOF" in everything the layout holds:
+                bruteforce() reads the layout's whole capacity before
+                calling it complete. The same goes for a ZIP whose end
+                record cannot be verified against its central directory.
     0.90        STGA header that is valid but whose body is not fully
                 extracted yet (bruteforce() then reads further and re-checks).
     0.88        A file signature whose file continues past the extracted
@@ -98,6 +104,8 @@ import math
 import os
 import re
 import struct
+import sys
+import unicodedata
 import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -442,10 +450,14 @@ def _text_quality(text: str, min_len: int = 3) -> float:
     * word-likeness: share of letters, digits and spaces. Natural language,
       hex and base64 are near 1; printable noise is about 0.66.
     * script consistency: random bytes that happen to be valid UTF-8 mostly
-      form two-byte characters between U+0080 and U+07FF (IPA, Greek,
-      Arabic, ...), sprinkled among ASCII. Real text is either almost all
-      ASCII/Latin or mostly another script, so a share of such characters
-      between about 10% and 65% gives 0.
+      form two-byte characters between U+0080 and U+07FF (Latin-1 symbols,
+      IPA, combining marks, Greek, Cyrillic, Hebrew, Arabic, ...), each one
+      isolated among ASCII and from a random block. Text that is almost all
+      ASCII/Latin (under about 10% such characters) or mostly one other
+      script (over about 65%) passes as is. In between, the run must look
+      like words of one script mixed with digits or Latin, e.g.
+      "Пароль: hunter2" or "Κωδικός: 4417": see _script_coherence().
+      Scattered characters from mixed blocks give 0.
     """
     n = len(text)
     if n <= max(3, min_len):
@@ -466,10 +478,67 @@ def _text_quality(text: str, min_len: int = 3) -> float:
     word_like = _clamp((wordy - 0.4) / 0.4)
     # Latin-1 symbols (U+0080-U+00BF) and the non-Latin two-byte range
     # (U+0250-U+07FF); accented Latin letters do not count.
-    exotic = float(np.mean(((codes >= 0x80) & (codes < 0xC0))
-                           | ((codes >= 0x250) & (codes < 0x800))))
+    exotic_mask = (((codes >= 0x80) & (codes < 0xC0))
+                   | ((codes >= 0x250) & (codes < 0x800)))
+    exotic = float(np.mean(exotic_mask))
     consistent = 1.0 - _clamp(min(exotic, 0.75 - exotic) / 0.1)
+    if consistent < 1.0:
+        consistent = max(consistent, _script_coherence(text, codes, exotic_mask))
     return length * diversity * aperiodic * word_like * consistent
+
+
+def _script_coherence(text: str, codes: np.ndarray, exotic: np.ndarray) -> float:
+    """Heuristic: do a run's non-Latin characters form words of one script? 0..1.
+
+    Used by _text_quality() when the share of a run's characters in the
+    two-byte non-Latin range (``exotic``) is penalised: fully between 10%
+    and 65%, partly just outside. That share is normal for a non-English
+    message with digits or Latin words in it, and also for random bytes
+    that happen to decode as UTF-8. Three things tell them apart:
+
+    * one script: real text takes its letters from a single Unicode block
+      (Cyrillic, Greek, Hebrew, Arabic, ...). Random two-byte characters
+      are spread over about seven 256-code-point blocks in U+0080-U+07FF.
+      ``dominant`` is the share of the most common block (code point >> 8);
+      it counts from 0.5 and gives full credit from 0.9.
+    * inside words: real letters sit next to other letters of the same
+      word, while a random character is followed by another two-byte
+      character only about 5% of the time. ``in_words`` is the share that
+      are letters or combining marks (Unicode category L* or M*) with a
+      neighbour from the same block; it counts from 0.3 and gives full
+      credit from 0.7, so short words such as Russian "в" and "у" are
+      tolerated.
+    * enough of them: at least three such in-word characters. Two
+      adjacent same-block letters still turn up in noise now and then.
+
+    Args:
+        text: The run.
+        codes: Its code points (uint32 array, one per character).
+        exotic: Boolean mask over ``codes`` of the two-byte non-Latin
+            characters.
+
+    Returns:
+        The product of the first two terms, or 0 when there are fewer than
+        three in-word characters.
+    """
+    idx = np.flatnonzero(exotic)
+    k = idx.size
+    if k < 3:
+        return 0.0
+    blocks = codes >> 8
+    dominant = float(np.bincount(blocks[idx]).max()) / k
+    # True where the next character is in the range and in the same block.
+    pair = exotic[1:] & exotic[:-1] & (blocks[1:] == blocks[:-1])
+    neighbour = np.zeros_like(exotic)
+    neighbour[1:] |= pair
+    neighbour[:-1] |= pair
+    lettery = np.fromiter((unicodedata.category(text[i])[0] in "LM" for i in idx),
+                          dtype=bool, count=k)
+    n_in_words = int(np.count_nonzero(neighbour[idx] & lettery))
+    if n_in_words < 3:
+        return 0.0
+    in_words = n_in_words / k
+    return _clamp((dominant - 0.5) / 0.4) * _clamp((in_words - 0.3) / 0.4)
 
 
 def _text_prefix(data: bytes) -> str | None:
@@ -503,11 +572,34 @@ def _result(score: float, kind: str, preview: str, data: bytes,
 # ---------------------------------------------------------------------------
 
 _STGA_MAGIC = b"STGA"
-_STGA_VERSION = 1
 _STGA_HEADER = struct.Struct(">4sBBII")  # magic, version, flags, body_len, crc32
 _STGA_HEADER_LEN = _STGA_HEADER.size     # 14
 _STGA_FLAGS = {0x01: "encrypted", 0x02: "file", 0x04: "compressed"}
 _STGA_FLAGS_ALL = 0x07
+
+# Frame versions this scanner recognises, mirroring payload.VERSION history
+# (kept here so the module does not import payload.py). Version 2, the one
+# payload.pack() writes, computes the CRC-32 over the 10 header bytes before
+# the CRC field (magic, version, flags, body_len) followed by the body;
+# version 1 (development frames) computed it over the body alone.
+_STGA_VERSIONS = (1, 2)
+_STGA_PREFIX_LEN = 10
+
+
+def _stga_crc(frame: bytes) -> int:
+    """CRC-32 of an STGA frame as its version defines it (see _STGA_VERSIONS).
+
+    Args:
+        frame: The frame from its magic on; the header must be complete and
+            the body may not be (the CRC then covers what is there).
+
+    Returns:
+        The unsigned CRC-32 value to compare with the header's crc32 field.
+    """
+    body = frame[_STGA_HEADER_LEN:]
+    if frame[4] == 1:
+        return zlib.crc32(body) & 0xFFFFFFFF
+    return zlib.crc32(body, zlib.crc32(frame[:_STGA_PREFIX_LEN])) & 0xFFFFFFFF
 
 
 def _check_stga(data: bytes) -> dict[str, Any] | None:
@@ -524,7 +616,7 @@ def _check_stga(data: bytes) -> dict[str, Any] | None:
         header = data[start:start + _STGA_HEADER_LEN]
         if len(header) == _STGA_HEADER_LEN:
             _, version, flags, body_len, crc = _STGA_HEADER.unpack(header)
-            if version == _STGA_VERSION and not flags & ~_STGA_FLAGS_ALL:
+            if version in _STGA_VERSIONS and not flags & ~_STGA_FLAGS_ALL:
                 break
         start = data.find(_STGA_MAGIC, start + 1)
     else:
@@ -558,7 +650,7 @@ def _check_stga(data: bytes) -> dict[str, Any] | None:
                        data[start:], info)
 
     body = data[start + _STGA_HEADER_LEN:frame_end]
-    crc_ok = (zlib.crc32(body) & 0xFFFFFFFF) == crc
+    crc_ok = _stga_crc(data[start:frame_end]) == crc
     info["crc_ok"] = crc_ok
     if crc_ok:
         score = 1.0
@@ -583,7 +675,11 @@ def _check_stga(data: bytes) -> dict[str, Any] | None:
 #
 # Each walker gets the bytes starting at the signature and returns
 # (status, length, details):
-#   "complete":  the file ends at ``length``.
+#   "complete":  the file ends at ``length``. If details["tentative"] is
+#                set, ``length`` is only the last end marker seen so far:
+#                the format allows the marker to appear again further on,
+#                so it is the end only if no more bytes follow (see
+#                _check_signatures()).
 #   "truncated": the file is longer than the bytes given; ``length`` is a
 #                lower bound on its total size (exact if details["exact"]).
 #   "invalid":   the signature matched but the structure does not parse.
@@ -706,21 +802,40 @@ def _walk_gif(buf: bytes) -> tuple[str, int | None, dict[str, Any]]:
         pos = nxt
 
 
+_ZIP_EOCD = b"PK\x05\x06"
+_ZIP_EOCD_LEN = 22
+
+
 def _walk_zip(buf: bytes) -> tuple[str, int | None, dict[str, Any]]:
-    # The end-of-central-directory record closes the archive.
-    i = buf.rfind(b"PK\x05\x06")
-    if i == -1 or i + 22 > len(buf):
-        return "truncated", len(buf) + 1, {}
-    (comment_len,) = struct.unpack("<H", buf[i + 20:i + 22])
-    end = i + 22 + comment_len
-    if end > len(buf):
-        return "truncated", end, {"exact": True}
-    return "complete", end, {}
+    # The end-of-central-directory (EOCD) record closes the archive. A
+    # stored member can be a ZIP itself, with an EOCD of its own, so a
+    # record only counts as the end when its central directory (offset +
+    # size, relative to the archive start, which is buf[0]) ends right
+    # where the record begins.
+    last = None
+    pos = buf.find(_ZIP_EOCD)
+    while pos != -1 and pos + _ZIP_EOCD_LEN <= len(buf):
+        cd_size, cd_offset, comment_len = struct.unpack("<IIH", buf[pos + 12:pos + 22])
+        end = pos + _ZIP_EOCD_LEN + comment_len
+        if cd_offset + cd_size == pos:
+            if end > len(buf):
+                return "truncated", end, {"exact": True}
+            return "complete", end, {}
+        if end <= len(buf):
+            last = end
+        pos = buf.find(_ZIP_EOCD, pos + 1)
+    if last is not None:
+        # Records that do not check out (ZIP64 archives store 0xFFFFFFFF
+        # there): fall back to the last one, as a tentative end.
+        return "complete", last, {"tentative": True}
+    return "truncated", len(buf) + 1, {}
 
 
 def _walk_pdf(buf: bytes) -> tuple[str, int | None, dict[str, Any]]:
-    # Heuristic: the last "%%EOF" in the bytes seen so far. A PDF with
-    # incremental updates has several, so a truncated window can stop early.
+    # Heuristic: the last "%%EOF" in the bytes seen so far, and only
+    # tentatively. A PDF can have several: one per incremental update, and
+    # linearized ("Fast Web View") files put a first-page trailer with its
+    # own "%%EOF" in the first few hundred bytes.
     i = buf.rfind(b"%%EOF")
     if i == -1:
         return "truncated", len(buf) + 1, {}
@@ -729,7 +844,7 @@ def _walk_pdf(buf: bytes) -> tuple[str, int | None, dict[str, Any]]:
         end += 2
     elif buf[end:end + 1] in (b"\n", b"\r"):
         end += 1
-    return "complete", end, {}
+    return "complete", end, {"tentative": True}
 
 
 def _walk_gzip(buf: bytes) -> tuple[str, int | None, dict[str, Any]]:
@@ -824,11 +939,18 @@ _RIFF_DESC = {"wav": "WAV audio", "avi": "AVI video", "webp": "WebP image",
               "riff": "RIFF container"}
 
 
-def _check_signatures(data: bytes) -> dict[str, Any] | None:
+def _check_signatures(data: bytes, at_end: bool = False) -> dict[str, Any] | None:
     """Find the earliest validated file signature near the start of data.
 
     Args:
         data: Extracted bytes.
+        at_end: True when no more bytes follow ``data`` (see
+            score_candidate()). A tentative end marker (PDF "%%EOF", an
+            unverified ZIP end record) is only accepted as the end then;
+            otherwise the candidate keeps its 0.97 score but is marked
+            ``complete=False`` with ``end_tentative=True`` and
+            ``needs_bytes`` set, so bruteforce() reads the rest of the
+            layout and takes the last marker.
 
     Returns:
         The best file candidate, or None.
@@ -855,8 +977,16 @@ def _check_signatures(data: bytes) -> dict[str, Any] | None:
             payload = buf
         else:
             status, length, details = walker(buf)
-            info.update({k: v for k, v in details.items() if k != "exact"})
-            if status == "complete":
+            info.update({k: v for k, v in details.items() if k not in ("exact", "tentative")})
+            if status == "complete" and details.get("tentative") and not at_end:
+                # The marker found may not be the last one. Keep the bytes
+                # up to it, but ask for everything after it too.
+                score, status = 0.97, "tentative"
+                info.update(complete=False, end_known=False, valid_structure=True,
+                            end_tentative=True, needs_bytes=len(data) + 1,
+                            needs_exact=False)
+                payload = buf[:length]
+            elif status == "complete":
                 score = 0.97
                 info.update(complete=True, end_known=True, valid_structure=True)
                 payload = buf[:length]
@@ -877,6 +1007,7 @@ def _check_signatures(data: bytes) -> dict[str, Any] | None:
         if "width" in info and "height" in info:
             size = f" {info['width']}x{info['height']},"
         state = {"complete": "complete", "truncated": "continues past extracted bytes",
+                 "tentative": "end marker found, may continue past extracted bytes",
                  "invalid": "structure does not parse", "unknown": "end not located"}[status]
         at = f" at offset {offset}" if offset else ""
         preview = f"{desc}{at},{size} {len(payload)} bytes ({state})"
@@ -992,7 +1123,7 @@ def _check_text(data: bytes) -> dict[str, Any] | None:
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_candidate(data: bytes) -> dict[str, Any]:
+def score_candidate(data: bytes, *, at_end: bool = False) -> dict[str, Any]:
     """Score extracted bytes for how much they look like a hidden payload.
 
     All checks are heuristics (see the module docstring for the score
@@ -1000,6 +1131,11 @@ def score_candidate(data: bytes) -> dict[str, Any]:
 
     Args:
         data: Bytes extracted under one strategy.
+        at_end: True when ``data`` is everything the strategy can read (the
+            image's full capacity for that layout), so nothing follows it.
+            Only formats whose end marker can repeat use it (PDF, and ZIP
+            when the end record cannot be verified): their last marker is
+            taken as the end only when ``at_end`` is True.
 
     Returns:
         A dict with:
@@ -1025,8 +1161,7 @@ def score_candidate(data: bytes) -> dict[str, Any]:
         f"binary, entropy {entropy:.2f} bits/byte: {_hex_preview(data)}",
         data, {},
     )
-    for check in (_check_stga, _check_signatures, _check_text):
-        cand = check(data)
+    for cand in (_check_stga(data), _check_signatures(data, at_end), _check_text(data)):
         if cand is not None and cand["score"] > best["score"]:
             best = cand
     best["info"]["entropy"] = round(entropy, 3)
@@ -1060,7 +1195,10 @@ def bruteforce(
     runs to the end), it is re-read with a larger window, up to the image's
     capacity and ``max_expand_bytes``, and scored again. The window grows to
     the exact frame or file size when the header gives one, otherwise it
-    doubles.
+    doubles. A PDF (or a ZIP whose end record does not verify) is read to
+    the cap in one step, since only its last end marker counts; if the cap
+    is ``max_expand_bytes`` rather than the capacity, it stays marked
+    ``truncated``.
 
     Args:
         image: Path, PIL image, or uint8 array (see _load_array()).
@@ -1093,7 +1231,7 @@ def bruteforce(
     candidates = []
     for strategy in strategies:
         window = extract_bytes(arr, strategy, max_bytes)
-        cand = score_candidate(window)
+        cand = score_candidate(window, at_end=len(window) >= capacity_bytes(arr, strategy))
         cand["strategy"] = strategy
         candidates.append(cand)
     # Stable sort: ties keep enumerate_strategies() order (common layouts first).
@@ -1130,6 +1268,11 @@ def _expand(arr: np.ndarray, cand: dict[str, Any], start_bytes: int,
             limit: int) -> dict[str, Any]:
     """Re-read a candidate with larger windows until it is complete.
 
+    The window grows to the exact size when the candidate gives one,
+    doubles otherwise, and jumps straight to the cap for a file whose end
+    marker may repeat (``end_tentative``: PDF, unverified ZIP), because
+    only the last marker in everything the layout holds is trusted.
+
     Args:
         arr: Image array.
         cand: A scored candidate with a "strategy" key.
@@ -1140,17 +1283,20 @@ def _expand(arr: np.ndarray, cand: dict[str, Any], start_bytes: int,
         The final scored candidate (with "strategy" set).
     """
     strategy = cand["strategy"]
-    cap = min(capacity_bytes(arr, strategy), limit)
+    capacity = capacity_bytes(arr, strategy)
+    cap = min(capacity, limit)
     size = start_bytes
     for _ in range(64):  # doubling from 1 byte reaches any size in < 64 steps
         needs = cand["info"].get("needs_bytes")
         if not needs or needs <= size or size >= cap:
             break
-        if cand["info"].get("needs_exact"):
+        if cand["info"].get("end_tentative"):
+            size = cap
+        elif cand["info"].get("needs_exact"):
             size = min(cap, needs)
         else:
             size = min(cap, max(needs, 2 * size))
-        cand = score_candidate(extract_bytes(arr, strategy, size))
+        cand = score_candidate(extract_bytes(arr, strategy, size), at_end=size >= capacity)
         cand["strategy"] = strategy
     return cand
 
@@ -1179,18 +1325,30 @@ def dictionary_attack(
 
     It works on any format the carriers package supports (PNG, BMP, TIFF,
     WAV, ...) because it goes through the carrier registry instead of
-    reading pixels itself. The cost is one permutation of all samples per
-    password (milliseconds for a typical image), so word lists of thousands
-    of entries are practical. Like any offline guessing attack it only
-    finds passwords that are on the list.
+    reading pixels itself. Like any offline guessing attack it only finds
+    passwords that are on the list.
+
+    Cost. Every password needs a pseudo-random permutation of all of the
+    carrier's samples (three per pixel in an image), and there is no
+    shortcut: the carrier's permutation has to be reproduced exactly, and
+    numpy's shuffle settles the first positions last. The cost therefore
+    grows with the image, at roughly 30 to 70 ms per password per megapixel on a laptop
+    (measured: 35 to 75 ms per password at 1024x1024, 0.7 to 0.8 s at
+    4000x3000). A list of 10,000 words takes about 10 minutes on a
+    1-megapixel image and about 2 hours on a 12-megapixel phone photo.
+    Trying a single depth (``bits_per_sample=(1,)``) saves only about 10%,
+    since the permutation dominates.
 
     Args:
         source: A path to a stego file, or an already loaded carrier
             (anything with ``extract(n_bits, key)``, ``capacity_bits()`` and
             a writable ``bits_per_sample`` attribute).
         passwords: Iterable of candidate passwords (str), e.g. the lines of
-            a word list. Trailing newlines are stripped; empty entries are
-            skipped because an empty key means "no scatter".
+            a word list. Trailing newlines are stripped, and so is a leading
+            U+FEFF byte order mark, which a word list saved as "UTF-8 with
+            BOM" (Windows Notepad, for example) puts before its first word
+            when it is read with plain "utf-8". Empty entries are skipped
+            because an empty key means "no scatter".
         bits_per_sample: Embedding depths to try for each password.
 
     Returns:
@@ -1221,7 +1379,7 @@ def dictionary_attack(
     original_bps = carrier.bits_per_sample
     try:
         for password in passwords:
-            password = str(password).rstrip("\r\n")
+            password = str(password).rstrip("\r\n").lstrip("﻿")
             if not password:
                 continue
             for bps in bits_per_sample:
@@ -1253,13 +1411,13 @@ def _try_scatter_key(carrier: Any, password: str, payload_module: Any) -> dict[s
         return None
     header = np.packbits(carrier.extract(header_bits, key=password)).tobytes()
     magic, version, flags, body_len, crc = _STGA_HEADER.unpack(header)
-    if magic != _STGA_MAGIC or version != _STGA_VERSION or flags & ~_STGA_FLAGS_ALL:
+    if magic != _STGA_MAGIC or version not in _STGA_VERSIONS or flags & ~_STGA_FLAGS_ALL:
         return None
     total_bits = (_STGA_HEADER_LEN + body_len) * 8
     if total_bits > capacity:
         return None
     frame = np.packbits(carrier.extract(total_bits, key=password)).tobytes()
-    if zlib.crc32(frame[_STGA_HEADER_LEN:]) & 0xFFFFFFFF != crc:
+    if _stga_crc(frame) != crc:
         return None
     info: dict[str, Any] = {
         "flags": flags,
@@ -1297,14 +1455,35 @@ def _try_scatter_key(carrier: Any, password: str, payload_module: Any) -> dict[s
 # Saving
 # ---------------------------------------------------------------------------
 
-def _unique_path(path: Path) -> Path:
-    """Return path, or path with _2, _3, ... before the suffix if it exists."""
-    if not path.exists():
-        return path
-    for n in range(2, 10000):
-        alt = path.with_name(f"{path.stem}_{n}{path.suffix}")
-        if not alt.exists():
-            return alt
+def _write_new(path: Path, data: bytes) -> Path:
+    """Write data to path, or to path with _2, _3, ... before the suffix.
+
+    Each name is opened with ``open(name, "xb")`` (O_CREAT | O_EXCL), which
+    fails if anything already exists there, including a symbolic link,
+    dangling or not. So an existing file is never overwritten, a link
+    planted at a predictable output name in a shared folder is never
+    followed, and there is no window between checking a name and creating
+    it.
+
+    Args:
+        path: Preferred output path.
+        data: Bytes to write.
+
+    Returns:
+        The path actually written.
+
+    Raises:
+        FileExistsError: If path and its first 9998 numbered variants all
+            exist.
+    """
+    for n in range(1, 10000):
+        candidate = path if n == 1 else path.with_name(f"{path.stem}_{n}{path.suffix}")
+        try:
+            with open(candidate, "xb") as fh:
+                fh.write(data)
+        except FileExistsError:
+            continue
+        return candidate
     raise FileExistsError(f"too many files named like {path}")
 
 
@@ -1328,9 +1507,11 @@ def save_candidate(candidate: dict[str, Any], out_dir: str | os.PathLike) -> str
       and is written the same way.
     * "binary": the raw bytes as ``.bin``.
 
-    Existing files are never overwritten; a numeric suffix is added. A file
-    name stored inside a payload is untrusted and is reduced to a safe bare
-    name first.
+    Existing files are never overwritten; a numeric suffix is added. Files
+    are created exclusively (see _write_new()), so a symbolic link already
+    sitting at an output name is skipped like any other existing file and
+    never followed. A file name stored inside a payload is untrusted and is
+    reduced to a safe bare name first.
 
     Args:
         candidate: One entry from bruteforce() or dictionary_attack() (or a
@@ -1355,14 +1536,10 @@ def save_candidate(candidate: dict[str, Any], out_dir: str | os.PathLike) -> str
 
     if kind == "text":
         text = data.decode(info.get("encoding", "utf-8"), errors="replace")
-        path = _unique_path(out / f"{stem}.txt")
-        path.write_text(text, encoding="utf-8")
-        return str(path)
+        return str(_write_new(out / f"{stem}.txt", text.encode("utf-8")))
     if kind.startswith("file:"):
         ext = re.sub(r"[^a-z0-9]", "", kind[5:].lower()) or "bin"
-        path = _unique_path(out / f"{stem}.{ext}")
-        path.write_bytes(data)
-        return str(path)
+        return str(_write_new(out / f"{stem}.{ext}", data))
     if kind == "stga":
         content: bytes | None
         filename: str | None
@@ -1382,27 +1559,38 @@ def save_candidate(candidate: dict[str, Any], out_dir: str | os.PathLike) -> str
             except Exception:
                 content, filename = None, None
         if content is None:
-            path = _unique_path(out / f"{stem}.stga")
-            path.write_bytes(data)
+            path = _write_new(out / f"{stem}.stga", data)
         elif filename:
-            path = _unique_path(out / f"{stem}_{_safe_name(filename)}")
-            path.write_bytes(content)
+            path = _write_new(out / f"{stem}_{_safe_name(filename)}", content)
         else:
             is_text = _text_prefix(content) is not None
-            path = _unique_path(out / f"{stem}.{'txt' if is_text else 'bin'}")
-            path.write_bytes(content)
+            path = _write_new(out / f"{stem}.{'txt' if is_text else 'bin'}", content)
         return str(path)
-    path = _unique_path(out / f"{stem}.bin")
-    path.write_bytes(data)
-    return str(path)
+    return str(_write_new(out / f"{stem}.bin", data))
 
 
 # ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
 
+# Below this score the candidate --save writes is probably noise (warning only).
+_SAVE_WARN_SCORE = 0.3
+
+
 def _main(argv: list[str] | None = None) -> int:
-    """Command-line entry point; see ``python bruteforce.py --help``."""
+    """Command-line entry point; see ``python bruteforce.py --help``.
+
+    Prints the ranked candidates (a table, or JSON with ``--json``), then
+    the word-list hits, then saves one payload with ``--save``: the first
+    word-list hit when there is one (it is already decrypted), otherwise
+    the best layout candidate. This matches ``main.py bruteforce``. With
+    ``--json``, everything except the JSON goes to stderr so stdout stays
+    parseable.
+
+    Returns:
+        0 on success, 1 if the image, word list or output folder cannot be
+        used. Invalid option values exit with status 2 (argparse).
+    """
     parser = argparse.ArgumentParser(
         description="Try many LSB layouts on an image and rank the recovered data.")
     parser.add_argument("image", help="image to scan (any format Pillow reads)")
@@ -1410,18 +1598,30 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-bytes", type=int, default=4096,
                         help="bytes read per strategy before expansion")
     parser.add_argument("--max-bit", type=int, default=1,
-                        help="highest bit plane to try (0 = LSB only)")
+                        help="highest bit plane to try, 0..7 (0 = LSB only)")
     parser.add_argument("--save", metavar="DIR",
-                        help="write the best candidate's payload into DIR")
+                        help="write the best payload into DIR (the word-list hit "
+                             "if there is one, else the top candidate)")
     parser.add_argument("--wordlist", metavar="FILE",
                         help="also try each line of FILE as a scatter/decryption "
                              "password (see dictionary_attack)")
     parser.add_argument("--json", action="store_true",
                         help="print JSON instead of a table")
     args = parser.parse_args(argv)
+    if args.top < 1:
+        parser.error("--top must be at least 1")
+    if args.max_bytes <= 0:
+        parser.error("--max-bytes must be positive")
+    if not 0 <= args.max_bit <= 7:
+        parser.error("--max-bit must be 0..7")
+    note = sys.stderr if args.json else sys.stdout
 
-    results = bruteforce(args.image, top_k=args.top, max_bytes=args.max_bytes,
-                         max_bit=args.max_bit)
+    try:
+        results = bruteforce(args.image, top_k=args.top, max_bytes=args.max_bytes,
+                             max_bit=args.max_bit)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps([{k: (v.to_dict() if k == "strategy" else v)
                            for k, v in r.items() if k != "data"} for r in results],
@@ -1429,17 +1629,33 @@ def _main(argv: list[str] | None = None) -> int:
     else:
         for r in results:
             print(f"{r['score']:.3f}  {r['label']:<26} {r['kind']:<10} {r['preview']}")
-    if args.save and results:
-        print(f"saved: {save_candidate(results[0], args.save)}")
 
+    hits: list[dict[str, Any]] = []
     if args.wordlist:
-        with open(args.wordlist, encoding="utf-8", errors="replace") as fh:
-            hits = dictionary_attack(args.image, fh)
+        try:
+            # "utf-8-sig" drops a byte order mark (dictionary_attack strips
+            # one too, for other callers).
+            with open(args.wordlist, encoding="utf-8-sig", errors="replace") as fh:
+                hits = dictionary_attack(args.image, fh)
+        except (OSError, ValueError) as exc:
+            print(f"error: wordlist: {exc}", file=sys.stderr)
+            return 1
         if not hits:
-            print("wordlist: no password matched")
+            print("wordlist: no password matched", file=note)
         for hit in hits:
             print(f"wordlist: password {hit['password']!r} "
-                  f"({hit['bits_per_sample']} bit/sample): {hit['preview']}")
+                  f"({hit['bits_per_sample']} bit/sample): {hit['preview']}", file=note)
+
+    if args.save:
+        best = hits[0] if hits else results[0]
+        if best["score"] < _SAVE_WARN_SCORE:
+            print(f"warning: the saved candidate only scored {best['score']:.2f}; "
+                  "it is probably noise", file=sys.stderr)
+        try:
+            print(f"saved: {save_candidate(best, args.save)}", file=note)
+        except OSError as exc:
+            print(f"error: could not save to {args.save!r}: {exc}", file=sys.stderr)
+            return 1
     return 0
 
 

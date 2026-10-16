@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import gzip
 import io
+import os
 import struct
+import zipfile
 import zlib
 from pathlib import Path
 
@@ -199,6 +201,104 @@ def test_file_longer_than_window_is_read_in_full(synthetic_rgb):
     assert top["info"]["truncated"] is False
 
 
+def linearized_pdf(seed: int = 0, body_len: int = 50_000) -> bytes:
+    """A PDF shaped like a linearized ("Fast Web View") file.
+
+    The first-page trailer and its "%%EOF" come in the first ~170 bytes;
+    the real end of the file is a second "%%EOF" after a long stream.
+    """
+    head = (b"%PDF-1.6\n%\xe2\xe3\xcf\xd3\n"
+            b"1 0 obj <</Linearized 1/L 60000/O 3/E 2000/N 1/T 59000/H [500 200]>>\n"
+            b"endobj\nxref\n1 1\n0000000016 00000 n \ntrailer <</Size 2/Prev 59000>>\n"
+            b"startxref\n0\n%%EOF\n")
+    stream = np.random.default_rng(seed).integers(0, 256, body_len, dtype=np.uint8).tobytes()
+    return (head + b"2 0 obj <</Length 50000>> stream\n" + stream
+            + b"\nendstream endobj\ntrailer <</Size 3>>\nstartxref\n116\n%%EOF\n")
+
+
+def test_pdf_with_early_eof_marker_is_read_to_the_last_one(synthetic_rgb, tmp_path):
+    # Regression: the first-page "%%EOF" of a linearized PDF used to be
+    # taken as the end, so a 50 KB PDF was reported complete at 169 bytes.
+    pdf = linearized_pdf()
+    assert pdf.index(b"%%EOF") < 4096 < len(pdf)
+    strategy = Strategy("RGB", 0, "msb", "row")
+    stego = embed(synthetic_rgb(8, 512), pdf, strategy)
+
+    top = bf.bruteforce(stego, top_k=1)[0]
+
+    assert top["strategy"] == strategy
+    assert top["kind"] == "file:pdf"
+    assert top["data"] == pdf
+    assert top["info"]["complete"] is True
+    assert top["info"]["truncated"] is False
+    assert Path(bf.save_candidate(top, tmp_path)).read_bytes() == pdf
+
+    # When expansion is capped before the layout's capacity, the result
+    # says it may be truncated instead of claiming to be complete.
+    capped = bf.bruteforce(stego, top_k=1, max_expand_bytes=20_000)[0]
+    assert capped["kind"] == "file:pdf"
+    assert capped["info"]["complete"] is False
+    assert capped["info"]["truncated"] is True
+
+
+def test_pdf_in_a_window_is_tentative_until_the_end():
+    pdf = b"%PDF-1.4\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n"
+    window = bf.score_candidate(pdf + b"\x00" * 64)
+    assert window["kind"] == "file:pdf"
+    assert window["data"] == pdf
+    assert window["info"]["complete"] is False
+    assert window["info"]["needs_bytes"] > window["info"]["window_bytes"]
+
+    final = bf.score_candidate(pdf + b"\x00" * 64, at_end=True)
+    assert final["data"] == pdf
+    assert final["info"]["complete"] is True
+    assert "needs_bytes" not in final["info"]
+
+
+def nested_zip(seed: int = 0) -> bytes:
+    """A stored ZIP whose first member is itself a small ZIP."""
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as zf:
+        zf.writestr("note.txt", "inner archive")
+    outer = io.BytesIO()
+    with zipfile.ZipFile(outer, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("inner.zip", inner.getvalue())
+        zf.writestr("data.bin", np.random.default_rng(seed).integers(
+            0, 256, 30_000, dtype=np.uint8).tobytes())
+    return outer.getvalue()
+
+
+def test_zip_containing_a_zip_is_not_cut_at_the_inner_end(synthetic_rgb, tmp_path):
+    # Regression: the inner archive's end record (in the first 4096 bytes)
+    # used to end the outer one.
+    zb = nested_zip()
+    strategy = Strategy("BGR", 0, "msb", "col")
+    stego = embed(synthetic_rgb(9, 512), zb, strategy)
+
+    top = bf.bruteforce(stego, top_k=1)[0]
+
+    assert top["strategy"] == strategy
+    assert top["kind"] == "file:zip"
+    assert top["data"] == zb
+    assert top["info"]["truncated"] is False
+    saved = bf.save_candidate(top, tmp_path)
+    with zipfile.ZipFile(saved) as zf:
+        assert zf.testzip() is None
+        assert sorted(zf.namelist()) == ["data.bin", "inner.zip"]
+
+
+def test_zip_end_record_that_checks_out_is_final():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("x.txt", "hello " * 100)
+        zf.comment = b"archive comment"
+    zb = buf.getvalue()
+    result = bf.score_candidate(zb + bytes(range(200)))
+    assert result["kind"] == "file:zip"
+    assert result["data"] == zb  # cut after the comment
+    assert result["info"]["complete"] is True
+
+
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_clean_image_scores_low(synthetic_rgb, seed):
     results = bf.bruteforce(synthetic_rgb(seed), top_k=5)
@@ -237,9 +337,50 @@ def test_legacy_latin1_text(synthetic_rgb, tmp_path):
         assert fh.read() == message
 
 
-def test_stga_frame_is_verified_and_expanded(synthetic_rgb, tmp_path):
+@pytest.mark.parametrize("message", [
+    "Пароль: hunter2",
+    "Встреча в 9:00 у входа 3, код 4417",
+    "Κωδικός: 4417, πύλη Β3",
+    "كلمة السر: 4417",
+])
+def test_legacy_mixed_script_messages_are_recognized(synthetic_rgb, message):
+    # Regression: non-Latin text mixed with digits or Latin words puts 10% to
+    # 65% of its characters in U+0250-U+07FF, which the script-consistency
+    # term used to treat as UTF-8 noise and score 0. report.py needs 0.5
+    # (its _LEGACY_MIN_SCORE) to recognise the legacy payload.
+    data = message.encode("utf-8")
+    stego = embed(synthetic_rgb(4), data + b"\x00" * 8, Strategy())
+
+    top = bf.bruteforce(stego, top_k=3)[0]
+
+    assert top["strategy"] == Strategy()
+    assert top["info"]["format"] == "legacy-delimiter"
+    assert top["data"] == data
+    assert top["score"] >= 0.5
+
+
+def test_scattered_two_byte_characters_still_score_low():
+    # The other side of the test above: two-byte characters from random
+    # Unicode blocks among ASCII letters and digits (about 35% of the run,
+    # with far more adjacent pairs than real noise produces) must not pass
+    # as a mixed-script message.
+    pool = "abcdefghijklmnopqrstuvwxyz0123456789 "
+    for seed in range(200):
+        rng = np.random.default_rng(seed)
+        text = "".join(chr(int(rng.integers(0x370, 0x800))) if rng.random() < 0.35
+                       else pool[int(rng.integers(len(pool)))] for _ in range(40))
+        result = bf.score_candidate(text.encode("utf-8") + b"\x00" * 8)
+        assert result["score"] < 0.3, text
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_stga_frame_is_verified_and_expanded(synthetic_rgb, tmp_path, version):
     body = ("frame body " * 30).encode()
-    frame = struct.pack(">4sBBII", b"STGA", 1, 0, len(body), zlib.crc32(body)) + body
+    prefix = struct.pack(">4sBBI", b"STGA", version, 0, len(body))
+    # Version 2 (what payload.py writes) checksums the header prefix and the
+    # body; version 1 (development frames) checksummed the body alone.
+    crc = zlib.crc32(prefix + body) if version == 2 else zlib.crc32(body)
+    frame = prefix + struct.pack(">I", crc) + body
     stego = embed(synthetic_rgb(7), frame, Strategy("RGB", 0, "msb", "row"))
 
     # A 64-byte first pass sees only the header; the frame length in the
@@ -249,11 +390,59 @@ def test_stga_frame_is_verified_and_expanded(synthetic_rgb, tmp_path):
     assert top["kind"] == "stga"
     assert top["score"] == 1.0
     assert top["data"] == frame
+    assert top["info"]["version"] == version
     assert top["info"]["crc_ok"] is True
     assert top["info"]["body_len"] == len(body)
     assert top["info"]["truncated"] is False
-    saved = bf.save_candidate(top, tmp_path)
-    assert Path(saved).read_bytes() in (body, frame)  # unpacked when payload.py loads
+
+    # Exactly one outcome per version. payload.py is part of this repo, so a
+    # version 2 frame is always unpacked: the file holds the body (printable,
+    # hence .txt), never the frame with its 14-byte header. payload.unpack()
+    # rejects version 1, so that frame is kept whole as .stga.
+    saved = Path(bf.save_candidate(top, tmp_path))
+    if version == 2:
+        assert saved.suffix == ".txt"
+        assert saved.read_bytes() == body
+    else:
+        assert saved.suffix == ".stga"
+        assert saved.read_bytes() == frame
+
+
+def test_encrypted_stga_frame_is_saved_raw(tmp_path):
+    # Without the password the frame cannot be unpacked, so save_candidate()
+    # keeps the whole frame, header included, as .stga for a later unpack.
+    import payload
+
+    frame = payload.pack("attack at dawn", password="correct horse")
+    cand = bf.score_candidate(frame + b"\x00" * 32)
+    assert cand["kind"] == "stga"
+    assert cand["data"] == frame
+    cand["strategy"] = Strategy("RGB", 0, "msb", "row")
+
+    saved = Path(bf.save_candidate(cand, tmp_path))
+    assert saved.suffix == ".stga"
+    assert saved.read_bytes() == frame
+    assert payload.unpack(saved.read_bytes(), password="correct horse").text() == "attack at dawn"
+
+
+def test_version_2_frame_crc_covers_the_header(synthetic_rgb):
+    # payload.py writes version 2 frames, whose CRC-32 covers the 10 header
+    # bytes before the CRC field as well as the body.
+    body = np.random.default_rng(0).integers(0, 256, 200, dtype=np.uint8).tobytes()
+    prefix = struct.pack(">4sBBI", b"STGA", 2, 0, len(body))
+    frame = prefix + struct.pack(">I", zlib.crc32(prefix + body)) + body
+
+    result = bf.score_candidate(frame + b"\x00" * 32)
+    assert result["kind"] == "stga"
+    assert result["score"] == 1.0
+    assert result["info"]["version"] == 2
+    assert result["data"] == frame
+
+    # A frame whose CRC covers the body alone is not a valid version 2 frame.
+    bad = prefix + struct.pack(">I", zlib.crc32(body)) + body
+    result = bf.score_candidate(bad + b"\x00" * 32)
+    assert result["info"]["crc_ok"] is False
+    assert result["score"] < 0.6
 
 
 def test_long_text_is_followed_past_the_window(synthetic_rgb):
@@ -344,6 +533,31 @@ def test_save_candidate_never_overwrites(tmp_path):
     assert first.endswith(".bin") and second.endswith(".bin")
 
 
+def test_save_candidate_does_not_follow_a_planted_symlink(tmp_path):
+    # Regression: a dangling symlink at the predictable output name made
+    # Path.exists() return False and the write follow the link out of
+    # out_dir.
+    out = tmp_path / "out"
+    out.mkdir()
+    target = tmp_path / "OUTSIDE.txt"
+    link = out / "bruteforce_RGB_bit0_msb_row.txt"
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are not available here")
+    cand = bf.score_candidate(b"Meet me at the old mill at midnight." + b"\x00" * 9)
+    cand["strategy"] = Strategy()
+    assert cand["kind"] == "text"
+
+    saved = Path(bf.save_candidate(cand, out))
+
+    assert saved == out / "bruteforce_RGB_bit0_msb_row_2.txt"
+    assert not saved.is_symlink()
+    assert saved.read_text(encoding="utf-8") == "Meet me at the old mill at midnight."
+    assert not target.exists()
+    assert link.is_symlink()
+
+
 # ---------------------------------------------------------------------------
 # Integration with the carriers package and payload.py
 # ---------------------------------------------------------------------------
@@ -401,3 +615,90 @@ def test_dictionary_attack_finds_scatter_password(synthetic_rgb, save_png, tmp_p
     saved = bf.save_candidate(hit, tmp_path / "out")
     assert Path(saved).read_bytes() == b"meet me at the usual place"
     assert bf.dictionary_attack(stego, ["wrong", "guesses"]) == []
+
+
+def scattered_stego(tmp_path: Path, cover: np.ndarray, message: str, password: str) -> Path:
+    """Hide an encrypted frame scattered with ``password`` (stego.py's layout)."""
+    carriers = pytest.importorskip("carriers")
+    payload = pytest.importorskip("payload")
+    bitutils = pytest.importorskip("bitutils")
+    cover_path = tmp_path / "cover.png"
+    Image.fromarray(cover).save(cover_path)
+    carrier = carriers.carrier_for_path(cover_path).load(cover_path)
+    carrier.embed(bitutils.bytes_to_bits(payload.pack(message, password=password)), key=password)
+    stego = tmp_path / "stego.png"
+    carrier.save(stego)
+    return stego
+
+
+def test_dictionary_attack_ignores_a_byte_order_mark(synthetic_rgb, tmp_path):
+    # Regression: a word list saved as "UTF-8 with BOM" and read as plain
+    # UTF-8 starts with U+FEFF, so its first password never matched.
+    stego = scattered_stego(tmp_path, synthetic_rgb(2), "attack at dawn", "tiger")
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("tiger\nlion\n", encoding="utf-8-sig")
+
+    with open(wordlist, encoding="utf-8") as fh:
+        hits = bf.dictionary_attack(stego, fh)
+
+    assert [h["password"] for h in hits] == ["tiger"]
+    assert hits[0]["data"] == b"attack at dawn"
+
+
+# ---------------------------------------------------------------------------
+# Command line (python bruteforce.py ...)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("args, message", [
+    (["--max-bit", "9"], "--max-bit must be 0..7"),
+    (["--max-bit", "-1"], "--max-bit must be 0..7"),
+    (["--max-bytes", "0"], "--max-bytes must be positive"),
+    (["--top", "0"], "--top must be at least 1"),
+])
+def test_cli_rejects_out_of_range_options(synthetic_rgb, save_png, capsys, args, message):
+    # Regression: these used to end in a ValueError traceback.
+    path = save_png(synthetic_rgb(0, 32), "clean.png")
+    with pytest.raises(SystemExit) as exc:
+        bf._main([str(path), *args])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "usage:" in err and message in err
+
+
+def test_cli_reports_a_missing_image_without_a_traceback(tmp_path, capsys):
+    assert bf._main([str(tmp_path / "missing.png")]) == 1
+    assert capsys.readouterr().err.startswith("error: ")
+
+
+def test_cli_save_with_wordlist_saves_the_password_hit(synthetic_rgb, tmp_path, capsys):
+    # Regression: --save wrote the top layout candidate (noise, since the
+    # payload is scattered) even when the word list found the password.
+    # main.py bruteforce saves the hit; the two entry points now agree.
+    stego = scattered_stego(tmp_path, synthetic_rgb(3), "The key is under the mat.",
+                            "correct horse")
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("123456\ncorrect horse\n", encoding="utf-8-sig")
+    out = tmp_path / "saved"
+
+    code = bf._main([str(stego), "--top", "2", "--save", str(out),
+                     "--wordlist", str(wordlist)])
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    assert "wordlist: password 'correct horse'" in stdout
+    saved = list(out.iterdir())
+    assert [p.name for p in saved] == ["wordlist_1bit.txt"]
+    assert saved[0].read_text(encoding="utf-8") == "The key is under the mat."
+
+
+def test_cli_json_output_stays_parseable_with_wordlist(synthetic_rgb, tmp_path, capsys):
+    import json
+
+    stego = scattered_stego(tmp_path, synthetic_rgb(5), "json please", "pw1")
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("pw1\n", encoding="utf-8")
+
+    assert bf._main([str(stego), "--top", "2", "--json", "--wordlist", str(wordlist)]) == 0
+    captured = capsys.readouterr()
+    assert len(json.loads(captured.out)) == 2
+    assert "wordlist: password 'pw1'" in captured.err

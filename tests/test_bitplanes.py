@@ -296,6 +296,143 @@ def test_save_lsb_diff_round_trip(tmp_path):
     np.testing.assert_array_equal(saved, np.where(expected.any(axis=2), 255, 0))
 
 
+def test_lsb_diff_grayscale_array_against_rgb_compares_all_channels():
+    # Regression: a 2-D cover array against an RGB stego used to be cut down
+    # to channel 0, so LSB changes in G and B were never reported.
+    gray = np.random.default_rng(0).integers(0, 256, (10, 10), dtype=np.uint8)
+    rgb = np.repeat(gray[..., None], 3, axis=2)
+    stego = rgb.copy()
+    stego[..., 1:] ^= 1  # flip the G and B LSBs only
+
+    assert int((lsb_diff(gray, stego) > 0).sum()) == 100
+    assert int((lsb_diff(stego, gray) > 0).sum()) == 100  # either argument order
+    np.testing.assert_array_equal(lsb_diff(gray, stego), lsb_diff(rgb, stego))
+    assert not lsb_diff(gray, stego, channel=0).any()
+    assert (lsb_diff(gray, stego, channel=1) == 255).all()
+    assert (lsb_diff(gray, stego, channel=2) == 255).all()
+
+    # Grayscale against RGBA: R, G and B are compared, alpha is ignored.
+    stego_rgba = np.dstack([stego, np.full(gray.shape, 255, np.uint8)])
+    assert int((lsb_diff(gray, stego_rgba) > 0).sum()) == 100
+    # Two grayscale arrays still compare their single channel.
+    assert not lsb_diff(gray, gray.copy()).any()
+    assert int((lsb_diff(gray, gray ^ 1) > 0).sum()) == 100
+
+
+# --- 16-bit sources ----------------------------------------------------------
+
+def _gradient16(height: int = 128) -> np.ndarray:
+    """A 16-bit horizontal ramp whose high bytes are exactly 0..255."""
+    return np.linspace(0, 65535, 256)[None, :].repeat(height, 0).astype(np.uint16)
+
+
+def _write_png48(path, arr16: np.ndarray) -> str:
+    """Write an (H, W, 3) uint16 array as a 48-bit RGB PNG.
+
+    Pillow cannot save 48-bit RGB, so the chunks are written by hand.
+    """
+    import struct
+    import zlib
+
+    h, w, _ = arr16.shape
+    raw = b"".join(b"\x00" + arr16[y].astype(">u2").tobytes() for y in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 16, 2, 0, 0, 0)  # 16-bit, truecolor
+    with open(path, "wb") as fh:
+        fh.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+                 + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    return str(path)
+
+
+def test_16bit_grayscale_file_is_scaled_not_clipped(tmp_path):
+    # Regression: Pillow's convert("RGB") clips 16-bit values above 255 to
+    # 255, which made 99.6% of every plane white. The planes must be those
+    # of the high byte (value >> 8) instead.
+    g16 = _gradient16()
+    path = str(tmp_path / "g16.png")
+    Image.fromarray(g16).save(path)
+    with Image.open(path) as img:
+        assert img.mode == "I;16"
+
+    # The high bytes are 0..255 once per row, so every plane is exactly half
+    # white; bit 7 is the left/right split of the ramp.
+    assert (bitplane(path, 0, 7) == 255).mean() == 0.5
+    high = (g16 >> 8).astype(np.uint8)
+    for channel in range(3):
+        for bit in range(8):
+            np.testing.assert_array_equal(bitplane(path, channel, bit),
+                                          bitplane(high, 0, bit))
+    np.testing.assert_array_equal(lsb_amplify(path)[..., 0], (high & 1) * 255)
+
+
+def test_16bit_rgb_png_shows_high_byte(tmp_path):
+    g16 = _gradient16(8)
+    arr16 = np.dstack([g16, g16[:, ::-1], np.full_like(g16, 0x8001)])
+    path = _write_png48(tmp_path / "rgb48.png", arr16)
+    high = (arr16 >> 8).astype(np.uint8)
+    for channel in range(3):
+        for bit in (0, 7):
+            np.testing.assert_array_equal(bitplane(path, channel, bit),
+                                          bitplane(high, channel, bit))
+
+
+def test_file_planes_match_image_carrier_pixels(tmp_path):
+    # The planes must be drawn from the pixels the image carrier embeds into,
+    # whatever the file's mode, so the grid and lsb_diff line up with stego.
+    from carriers.image_lsb import ImageLSBCarrier
+
+    paths = [str(tmp_path / "g16.png"), _save(_synthetic(15), tmp_path / "rgb.png"),
+             _save(_rgba(16), tmp_path / "rgba.png")]
+    Image.fromarray(_gradient16(16)).save(paths[0])
+    Image.fromarray(_synthetic(17)[..., 0]).save(tmp_path / "l.png")
+    paths.append(str(tmp_path / "l.png"))
+    for path in paths:
+        pixels = ImageLSBCarrier.load(path).pixels
+        for channel in range(pixels.shape[2]):
+            for bit in (0, 7):
+                np.testing.assert_array_equal(bitplane(path, channel, bit),
+                                              bitplane(pixels, channel, bit))
+
+
+def test_grid_title_says_when_low_bits_are_not_shown(tmp_path):
+    from bitplanes import _read_file
+
+    g16_path = str(tmp_path / "g16.png")
+    Image.fromarray(_gradient16(16)).save(g16_path)
+    png48 = _write_png48(tmp_path / "rgb48.png", np.dstack([_gradient16(8)] * 3))
+    png8 = _save(_synthetic(18), tmp_path / "rgb8.png")
+
+    for path in (g16_path, png48):
+        note = _read_file(path)[1]
+        assert note is not None and "high byte" in note and "not shown" in note
+    assert _read_file(png8)[1] is None
+
+    # The two-line title must not change the figure's pixel size.
+    with Image.open(save_bitplane_grid(g16_path, tmp_path / "g.png")) as img:
+        assert img.size == grid_size_px(3, 8)
+
+
+def test_hide_in_16bit_cover_changes_only_payload_lsbs(tmp_path):
+    # End to end: with the cover read the same way as the carrier, the LSB
+    # diff marks only the few pixels the payload went into, not ~99.6% of
+    # the image as when the cover was clipped to white.
+    import payload
+    import stego
+
+    cover = str(tmp_path / "g16.png")
+    Image.fromarray(_gradient16()).save(cover)
+    out = str(tmp_path / "stego.png")
+    stego.hide(cover, out, "hi")
+
+    changed = int((lsb_diff(cover, out) > 0).sum())
+    frame_bits = (payload.HEADER_LEN + len(b"hi")) * 8
+    assert 0 < changed <= -(-frame_bits // 3)  # at most one pixel per 3 bits
+
+
 # --- module hygiene ----------------------------------------------------------
 
 def test_import_does_not_load_pyplot():

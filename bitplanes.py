@@ -20,6 +20,12 @@ heavy texture) already have random-looking LSBs, while key-scattered or
 low-rate embedding leaves no visible band at all. The numeric detectors in the
 ``detectors`` package are the quantitative counterpart.
 
+Files are read exactly as the image carrier reads a cover
+(``carriers.image_lsb.image_to_array``), so the planes are the 8-bit samples
+an embedder writes into. For a 16-bit file that is the high byte of each
+sample: the planes are correctly scaled (not clipped to white), but the
+file's own low byte is not shown, and the grid's title says so.
+
 Public functions:
 
 * ``bitplane``: one bit of one channel as a 0/255 image.
@@ -49,12 +55,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from typing import Iterable
 
 import numpy as np
 from PIL import Image
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+
+from carriers.image_lsb import image_to_array
 
 # --- Grid geometry -----------------------------------------------------------
 # All sizes are chosen so that inches * GRID_DPI is a whole number of pixels.
@@ -77,16 +86,88 @@ GRID_MAX_PANEL_PX = 512
 # Channel letter -> index along the last axis of an (H, W, 3 or 4) array.
 CHANNEL_INDEX = {"R": 0, "G": 1, "B": 2, "A": 3}
 
-# Pillow modes that carry transparency and are therefore loaded as RGBA.
-_ALPHA_MODES = {"RGBA", "LA", "PA", "RGBa", "La"}
+# Pillow raw modes that decode 16 bits per sample into an 8-bit mode by
+# keeping only the high byte (48/64-bit RGB(A) PNG and TIFF). Same rule as the
+# detectors package uses.
+_SIXTEEN_BIT_RAWMODE = re.compile(r";16[BLN]")
+
+
+def _depth_note(img: Image.Image) -> str | None:
+    """Describe how a file with more than 8 bits per sample was reduced.
+
+    The bit planes are always drawn from the 8-bit view that the image
+    carrier embeds into (``carriers.image_lsb.image_to_array``). For a
+    16-bit file that view is the high byte of each sample, so the file's own
+    low-order bits, where a 16-bit LSB payload would sit, are not shown. This
+    note lets the grid say so instead of silently labelling bit 8 of the
+    file "bit 0 (LSB)".
+
+    Must be called on a freshly opened image, before it is loaded: Pillow
+    clears ``img.tile`` on load, and the tile's raw mode is the only sign
+    that a 48-bit RGB or 64-bit RGBA file was decoded to 8-bit "RGB" or
+    "RGBA".
+
+    Args:
+        img: A Pillow image that has been opened but not yet loaded.
+
+    Returns:
+        A short sentence for the figure title, or None when the file has 8
+        bits per sample (nothing is hidden by the 8-bit view).
+    """
+    mode = img.mode
+    rawmodes = []
+    for tile in getattr(img, "tile", None) or []:
+        args = tile[3] if len(tile) > 3 else None
+        rawmodes.append(args[0] if isinstance(args, tuple) and args else args)
+    # ";16B"/";16L"/";16N" raw modes carry 16 bits per sample. Packed-pixel
+    # modes such as "BGR;16" (an RGB565 BMP) have 8 or fewer bits per sample
+    # and are deliberately not matched.
+    if mode.startswith("I;16") or any(
+            isinstance(r, str) and _SIXTEEN_BIT_RAWMODE.search(r) for r in rawmodes):
+        return "16-bit samples: planes show the high byte; the low byte is not shown"
+    if mode in ("I", "F"):
+        values = np.asarray(img)
+        if values.size and not (
+                np.all(np.isfinite(values)) and values.min() >= 0 and values.max() <= 255
+                and np.all(values == np.floor(values))):
+            return (f"mode {mode} samples scaled to 8 bits; "
+                    "the low-order bits are not shown")
+    return None
+
+
+def _read_file(path) -> tuple[np.ndarray, str | None]:
+    """Open an image file as the 8-bit array the image carrier sees.
+
+    Args:
+        path: Path (``str`` or ``os.PathLike``) to any image Pillow can read.
+
+    Returns:
+        ``(arr, note)``: ``arr`` is a uint8 (H, W, 3) or (H, W, 4) array from
+        ``carriers.image_lsb.image_to_array``; ``note`` is ``_depth_note``'s
+        sentence for a file with more than 8 bits per sample, else None.
+
+    Raises:
+        FileNotFoundError: If the path does not exist.
+        PIL.UnidentifiedImageError: If the file is not a readable image.
+    """
+    with Image.open(path) as img:
+        note = _depth_note(img)  # before image_to_array() loads the pixels
+        return image_to_array(img), note
 
 
 def _load(image) -> np.ndarray:
     """Return ``image`` as a uint8 array, loading it from disk if needed.
 
-    Paths are opened with Pillow and normalized the same way as the image
-    carrier: images with an alpha channel (RGBA, LA, PA, or a palette image
-    with a transparency entry) become RGBA, everything else becomes RGB.
+    Paths are opened with Pillow and converted exactly as the image carrier
+    converts a cover (``carriers.image_lsb.image_to_array``), so the planes
+    shown are the pixels an embedder writes into: images with any
+    transparency (alpha, a transparent palette entry or a PNG ``tRNS``
+    colour key) become RGBA, everything else becomes RGB. Samples wider than
+    8 bits are scaled, not clipped: a 16-bit file keeps its high byte
+    (``value >> 8``), so bit 7 here is bit 15 of the file and the file's low
+    byte is not visible (``save_bitplane_grid`` says so in its title).
+    Pillow's plain ``convert("RGB")`` would instead clip every 16-bit value
+    above 255 to 255 and turn every plane almost entirely white.
     Arrays are passed through after validation, so a 2-D grayscale array stays
     2-D.
 
@@ -106,10 +187,7 @@ def _load(image) -> np.ndarray:
             0..255.
     """
     if isinstance(image, (str, os.PathLike)):
-        with Image.open(image) as img:
-            has_alpha = img.mode in _ALPHA_MODES or (
-                img.mode == "P" and "transparency" in img.info)
-            return np.asarray(img.convert("RGBA" if has_alpha else "RGB"))
+        return _read_file(image)[0]
 
     if not isinstance(image, np.ndarray):
         raise TypeError(f"expected a path or numpy array, got {type(image).__name__}")
@@ -221,6 +299,11 @@ def save_bitplane_grid(image, out_path, channels: str = "RGB",
     large images are stride-subsampled for display (see
     ``GRID_MAX_PANEL_PX``); the planes themselves are exact.
 
+    A file with more than 8 bits per sample is shown as its 8-bit view (the
+    high byte of a 16-bit file, see ``_load``), and a second title line says
+    that the file's low-order bits are not shown, so bit 0 in the grid is not
+    mistaken for the file's real LSB.
+
     Args:
         image: Path to an image file, or a uint8 array of shape (H, W),
             (H, W, 3) or (H, W, 4).
@@ -237,7 +320,10 @@ def save_bitplane_grid(image, out_path, channels: str = "RGB",
     Raises:
         ValueError: If a channel letter or bit is invalid, or ``bits`` is empty.
     """
-    arr = _load(image)
+    if isinstance(image, (str, os.PathLike)):
+        arr, note = _read_file(image)
+    else:
+        arr, note = _load(image), None
     rows = _grid_rows(arr, channels)
     cols = sorted({_check_bit(b) for b in bits}, reverse=True)
     if not cols:
@@ -256,8 +342,10 @@ def save_bitplane_grid(image, out_path, channels: str = "RGB",
     axes = fig.subplots(len(rows), len(cols), squeeze=False)
 
     name = os.path.basename(os.fspath(image)) if isinstance(image, (str, os.PathLike)) else "image"
-    fig.suptitle(f"Bit planes of {name} ({width}x{height}), white = 1",
-                 fontsize=11)
+    title = f"Bit planes of {name} ({width}x{height}), white = 1"
+    if note:
+        title += f"\n{note}"
+    fig.suptitle(title, fontsize=11)
 
     for r, (label, ch) in enumerate(rows):
         for c, bit in enumerate(cols):
@@ -315,6 +403,11 @@ def lsb_diff(cover, stego, channel: int | None = None, *, bits: int = 1) -> np.n
     the pixels and the any-channel mask over R, G and B about 7/8
     (1 - (1/2)**3), rather than all of them.
 
+    A 2-D grayscale array compared with a color image is first repeated into
+    R, G and B (the image carrier stores a grayscale cover as RGB and embeds
+    in all three channels). When one image has alpha and the other does
+    not, only R, G and B are compared.
+
     Args:
         cover: The original image, as a path or uint8 array.
         stego: The suspected stego image, same size as ``cover``.
@@ -341,6 +434,14 @@ def lsb_diff(cover, stego, channel: int | None = None, *, bits: int = 1) -> np.n
     if a.shape[:2] != b.shape[:2]:
         raise ValueError(f"image sizes differ: {a.shape[1]}x{a.shape[0]} "
                          f"vs {b.shape[1]}x{b.shape[0]}")
+    # Grayscale vs color (e.g. an "L" cover array against the RGB stego the
+    # image carrier writes for it): repeat the gray channel into R, G and B,
+    # as lsb_amplify does, so changes in G and B are compared too instead of
+    # being cut off by the truncation below.
+    if a.shape[2] == 1 and b.shape[2] > 1:
+        a = np.repeat(a, 3, axis=2)
+    elif b.shape[2] == 1 and a.shape[2] > 1:
+        b = np.repeat(b, 3, axis=2)
     if a.shape[2] != b.shape[2]:
         # RGB vs RGBA (e.g. a JPEG cover against an RGBA stego): compare only
         # the channels both images have.
