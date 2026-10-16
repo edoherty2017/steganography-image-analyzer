@@ -4,18 +4,23 @@ Unlike the statistical detectors, this one reads the hidden data directly:
 it rebuilds the first few kilobytes of the LSB stream in the orders that
 simple LSB tools use and looks for things that do not occur by chance:
 
-* This project's payload header: ``b"STGA"`` magic, version 1, flags and a
+* This project's payload header: ``b"STGA"`` magic, version, flags and a
   big-endian body length and CRC-32 (the 14-byte frame header written by
-  ``payload.pack``; parsed here independently). A header whose version,
-  flags and length are plausible is definitive (score 1.0); when the whole
-  body fits in the image its CRC-32 is checked as well.
+  ``payload.pack``; parsed here independently). Version 2, the one
+  ``payload.pack`` writes, computes the CRC-32 over the 10 header bytes
+  before the CRC field followed by the body; version 1 (development frames)
+  computed it over the body alone. A header whose version, flags and length
+  are plausible is definitive (score 1.0); when the whole body fits in the
+  image its CRC-32 is checked as well.
 * Magic numbers of common file formats (PNG, JPEG, GIF, ZIP/DOCX/XLSX, PDF,
   GZIP, BMP, 7z, RAR, XZ, ELF, RIFF/WAV), i.e. a file hidden without any
   wrapper.
 * Readable text: the legacy encoder of this project writes the message as
   plain bytes from the first pixel on, followed by 8 zero bytes. A long,
-  varied run of printable ASCII (or a short one followed by that zero
-  marker) at the start of the stream is reported with a preview.
+  varied run of printable ASCII (or a short one of 3+ bytes followed by
+  that zero marker) at the start of the stream is reported with a preview.
+  One or two printable bytes before the marker are ignored: dark images
+  produce them by chance.
 
 Orders scanned (row-major pixels; bytes assembled MSB-first unless noted):
 ``RGB`` (this project's order), ``BGR``, each channel alone, ``RGB/2bit``
@@ -29,8 +34,8 @@ detectors still see them.
 Scores (heuristic): valid STGA header 1.0 (0.9 if its CRC fails); file
 magic at offset 0 0.9, elsewhere 0.75 for signatures of 6+ bytes and 0.5
 for 4-5 bytes (3-byte signatures only count at offset 0); text at the
-start 0.6 to 0.85 depending on length and the zero marker; long text
-deeper in the stream 0.5.
+start 0.6 to 0.85 depending on length and the zero marker (0.45 for a
+3-byte run followed by the marker); long text deeper in the stream 0.5.
 """
 from __future__ import annotations
 
@@ -50,8 +55,9 @@ SCAN_BYTES = 4096
 # Local copy of the STGA frame layout (payload.py is the authority; this
 # module re-parses it so the detector has no dependency on the encoder).
 STGA_MAGIC = b"STGA"
-STGA_VERSION = 1
+STGA_VERSIONS = (1, 2)  # mirrors payload.VERSION history (see module docstring)
 STGA_HEADER_LEN = 14
+STGA_PREFIX_LEN = 10    # header bytes before the CRC field (covered by the v2 CRC)
 STGA_FLAGS = {0x01: "encrypted", 0x02: "file", 0x04: "compressed"}
 
 # (label, magic bytes, file extension)
@@ -70,6 +76,15 @@ FILE_SIGNATURES: tuple[tuple[str, bytes, str], ...] = (
     ("RIFF container", b"RIFF", "riff"),
 )
 RIFF_KINDS = {b"WAVE": ("WAV audio", "wav"), b"AVI ": ("AVI video", "avi"), b"WEBP": ("WebP image", "webp")}
+
+# Shortest text run that counts when followed by the legacy zero marker. One
+# or two printable bytes then 8 zero bytes occur by chance wherever the LSBs
+# are sparse (near-black or clipped regions): a lone 0x20 (space) is a single
+# set bit. In simulated sparse LSB streams (bit density 1% to 5%) a printable
+# run of any length followed by the marker turns up by chance in up to about
+# 1e-2 of scan orders, a varied 2-byte run in about 1e-4 and a varied 3-byte
+# run in about 5e-6. Heuristic threshold.
+MIN_MARKED_TEXT = 3
 
 _PRINTABLE = frozenset(bytes(string.printable, "ascii")) - frozenset(b"\x0b\x0c")
 _TEXTY = frozenset(bytes(string.ascii_letters + string.digits + " .,;:'\"!?-()\n", "ascii"))
@@ -124,7 +139,8 @@ def parse_stga_header(header: bytes) -> dict[str, Any] | None:
 
     Returns:
         Dict with ``version``, ``flags``, ``flag_names``, ``body_len``,
-        ``crc32`` and ``plausible`` (version 1 and only known flag bits), or
+        ``crc32`` and ``plausible`` (a known version and only known flag
+        bits), or
         None if ``header`` is too short or does not start with the magic.
     """
     if len(header) < STGA_HEADER_LEN or header[:4] != STGA_MAGIC:
@@ -135,7 +151,23 @@ def parse_stga_header(header: bytes) -> dict[str, Any] | None:
     crc = int.from_bytes(header[10:14], "big")
     names = [n for bit, n in STGA_FLAGS.items() if flags & bit]
     return {"version": version, "flags": flags, "flag_names": names, "body_len": body_len,
-            "crc32": crc, "plausible": version == STGA_VERSION and not (flags & ~0x07)}
+            "crc32": crc, "plausible": version in STGA_VERSIONS and not (flags & ~0x07)}
+
+
+def _frame_crc(version: int, prefix: bytes, body: bytes) -> int:
+    """CRC-32 of an STGA frame as its version defines it.
+
+    Args:
+        version: Header version byte (1 or 2).
+        prefix: The STGA_PREFIX_LEN header bytes before the CRC field.
+        body: The frame body.
+
+    Returns:
+        The unsigned CRC-32 to compare with the header's crc32 field.
+    """
+    if version == 1:
+        return zlib.crc32(body) & 0xFFFFFFFF
+    return zlib.crc32(body, zlib.crc32(prefix)) & 0xFFFFFFFF
 
 
 def _text_run(data: bytes, start: int) -> int:
@@ -196,7 +228,8 @@ def _scan_stga(a, order, spec, data) -> list[dict[str, Any]]:
             total = off + STGA_HEADER_LEN + hdr["body_len"]
             full = data if total <= len(data) else lsb_bytes(a, spec[0], spec[1], spec[2], total)
             body = full[off + STGA_HEADER_LEN: total]
-            finding["crc_ok"] = (zlib.crc32(body) & 0xFFFFFFFF) == hdr["crc32"]
+            prefix = full[off:off + STGA_PREFIX_LEN]
+            finding["crc_ok"] = _frame_crc(hdr["version"], prefix, body) == hdr["crc32"]
             if not (hdr["flags"] & 0x05):  # neither encrypted nor compressed: readable
                 if hdr["flags"] & 0x02 and len(body) >= 2:
                     name_len = int.from_bytes(body[:2], "big")
@@ -255,7 +288,8 @@ def _scan_text(order, data) -> list[dict[str, Any]]:
         score = 0.8
     elif lead >= 8 and _texty(run):
         score = 0.6
-    elif marker and lead >= 1:
+    elif lead >= MIN_MARKED_TEXT and marker and _texty(run):
+        # Only reached for a 3-byte run (4+ bytes with the marker score 0.8).
         score = 0.45
     if score:
         found.append({"kind": "text", "order": order, "offset": 0, "length": lead,

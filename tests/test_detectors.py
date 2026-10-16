@@ -319,15 +319,121 @@ def test_chi_square_full_sequential_has_high_p(structured):
         assert min(d["p_curve"]["RGB"]) > 0.5, key
         assert d["estimated_sequential_fraction"] == 1.0, key
         assert r["verdict"] == "likely_stego", key
+        # A real full payload reaches the end with a tail that looks embedded.
+        assert d["run_ended_by"] == "end_of_stream", key
+        assert d["tail"][d["stream"]]["state"] == "embedded", key
+        assert d["estimate_kind"] == "whole_stream", key
+        assert "every sample" in r["summary"], key
 
 
 @pytest.mark.parametrize("rate", [0.25, 0.5])
 def test_chi_square_estimates_sequential_length(structured, rate):
     for key, cover in structured.items():
         r = detectors.run("chi_square", embed_lsb(cover, rate, "seq"))
-        f = r["details"]["estimated_sequential_fraction"]
+        d = r["details"]
+        f = d["estimated_sequential_fraction"]
         assert f == pytest.approx(rate, abs=0.1), key
         assert r["verdict"] == "likely_stego", key
+        assert d["run_ended_by"] == "pairs_unbalanced", key
+        assert d["estimate_kind"] == "located", key
+        assert "about that size" in r["summary"], key
+
+
+def test_chi_square_run_ended_by_control_is_not_a_size_estimate(synthetic_rgb):
+    # Regression: 100% sequential embedding in the wide-gradient cover. The
+    # pairs never become unbalanced; the run stops after ~25% only because
+    # the control pairs become balanced too. That must not be reported as
+    # "then unbalanced ... payload of about that size".
+    r = detectors.run("chi_square", embed_lsb(synthetic_rgb(0), 1.0, "seq"))
+    d = r["details"]
+    f = d["estimated_sequential_fraction"]
+    assert 0.0 < f < 1.0
+    assert d["run_ended_by"] == "control_balanced"
+    assert d["estimate_kind"] == "open"
+    assert d["per_stream_ended_by"][d["stream"]] == "control_balanced"
+    # The pairs really were still equalized when the run stopped.
+    i = d["prefix_fractions"].index(f)
+    assert d["p_curve"][d["stream"]][i + 1] > chi_mod.P_THRESHOLD
+    assert d["p_control_curve"][d["stream"]][i + 1] >= chi_mod.CONTROL_ALPHA
+    assert f"inconclusive beyond {f:.0%}" in r["summary"]
+    assert "about that size" not in r["summary"]
+    assert "then unbalanced" not in r["summary"]
+    assert r["verdict"] == "likely_stego"
+
+
+def test_chi_square_payload_staircase_does_not_claim_whole_stream():
+    # Regression: 25% sequential embedding in a smooth natural cover. The
+    # payload's staircase keeps the R stream's cumulative control pairs
+    # unbalanced while the clean remainder's pairs are balanced anyway, so
+    # the R run reaches the end of the stream. Its tail is not embedded, so
+    # it must not be reported as "LSB embedding in every sample".
+    r = detectors.run("chi_square", embed_lsb(natural_cover(0), 0.25, "seq"))
+    d = r["details"]
+    overshot = [k for k, e in d["per_stream_ended_by"].items()
+                if e == "end_of_stream" and d["tail"][k]["state"] != "embedded"]
+    assert overshot, "expected at least one stream whose run overshoots the payload"
+    for k in overshot:
+        assert d["per_stream_estimate_kind"][k] == "open", k
+    assert d["stream"] not in overshot
+    assert d["estimated_sequential_fraction"] < 1.0
+    assert d["estimate_kind"] != "whole_stream"
+    assert "every sample" not in r["summary"]
+    assert r["verdict"] == "likely_stego"
+
+
+def _curve(points):
+    return [{"fraction": (i + 1) / len(points), "p": p, "p_control": pc}
+            for i, (p, pc) in enumerate(points)]
+
+
+@pytest.mark.parametrize("points,fraction,ended_by", [
+    ([(0.9, 0.0), (0.9, 0.0), (0.1, 0.0), (0.9, 0.0)], 0.5, "pairs_unbalanced"),
+    ([(0.9, 0.0), (0.9, 0.5), (0.9, 0.0), (0.9, 0.0)], 0.25, "control_balanced"),
+    ([(0.9, 0.0), (float("nan"), 0.0), (0.9, 0.0), (0.9, 0.0)], 0.25, "undefined"),
+    ([(0.9, 0.0), (0.9, float("nan")), (0.9, 0.0), (0.9, 0.0)], 0.25, "undefined"),
+    ([(0.9, 0.0)] * 4, 1.0, "end_of_stream"),
+    ([(0.2, 0.9), (0.9, 0.0), (0.9, 0.0), (0.9, 0.0)], 0.0, "pairs_unbalanced"),
+    ([(0.9, 0.9), (0.9, 0.0), (0.9, 0.0), (0.9, 0.0)], 0.0, "control_balanced"),
+])
+def test_leading_run_reports_why_the_run_ended(points, fraction, ended_by):
+    curve = _curve(points)
+    run = chi_mod.leading_run(curve)
+    assert run == {"fraction": fraction, "ended_by": ended_by}
+    assert chi_mod.leading_fraction(curve) == fraction
+
+
+def test_estimate_kind_needs_an_embedded_tail_for_whole_stream():
+    full = {"fraction": 1.0, "ended_by": "end_of_stream"}
+    assert chi_mod.estimate_kind(full, {"state": "embedded"}) == "whole_stream"
+    for state in ("smooth", "unbalanced", "undefined"):
+        assert chi_mod.estimate_kind(full, {"state": state}) == "open"
+    tail = {"state": "embedded"}
+    assert chi_mod.estimate_kind({"fraction": 0.3, "ended_by": "pairs_unbalanced"},
+                                 tail) == "located"
+    assert chi_mod.estimate_kind({"fraction": 0.3, "ended_by": "control_balanced"},
+                                 tail) == "open"
+    assert chi_mod.estimate_kind({"fraction": 0.0, "ended_by": "pairs_unbalanced"},
+                                 tail) == "none"
+
+
+def test_tail_test_states():
+    rng = np.random.default_rng(0)
+    # Comb histogram (even values only, uneven pair totals): LSB pairs unbalanced.
+    w = rng.uniform(0.2, 1.0, 64)
+    comb = (rng.choice(64, 20000, p=w / w.sum()) * 2 + 60).astype(np.uint8)
+    assert chi_mod.tail_test(comb)["state"] == "unbalanced"
+    # The same comb with random LSBs: pairs equalized, and the uneven pair
+    # totals leave a staircase that unbalances the control pairs.
+    filled = comb | rng.integers(0, 2, comb.size).astype(np.uint8)
+    assert chi_mod.tail_test(filled)["state"] == "embedded"
+    # Flat histogram: both balanced.
+    flat = rng.integers(0, 256, 20000).astype(np.uint8)
+    assert chi_mod.tail_test(flat)["state"] == "smooth"
+    # Only the tail is tested: a clean comb tail after an embedded head.
+    mixed = np.concatenate([filled[:16000], comb[16000:]])
+    t = chi_mod.tail_test(mixed)
+    assert t["samples"] == 4000 and t["state"] == "unbalanced"
+    assert chi_mod.tail_test(np.full(100, 7, np.uint8))["state"] == "undefined"
 
 
 def test_chi_square_smooth_histogram_is_inconclusive_not_alarm(covers):
@@ -421,6 +527,83 @@ def test_randomness_does_not_call_text_random(covers):
     assert r["verdict"] == "clean"
 
 
+def page_with_photo_banner(base_noise: float, extra_noise: float, rows: int = 128,
+                           size: int = 512) -> np.ndarray:
+    """Clean screenshot-like image: a noisy photo banner over a flat text page.
+
+    The banner's LSBs are random (photo noise) and the page's are not, so the
+    LSB stream has the random-then-structured profile of a sequential payload
+    without carrying one.
+    """
+    from PIL import ImageDraw
+
+    page = Image.new("RGB", (size, size), (250, 250, 250))
+    draw = ImageDraw.Draw(page)
+    for i in range(16):
+        draw.text((24, rows + 32 + 20 * i),
+                  f"Lorem ipsum dolor sit amet, consectetur adipiscing elit {i}", fill=(30, 30, 30))
+    out = np.asarray(page).copy()
+    photo = natural_cover(3, size=size, noise=base_noise)[:rows].astype(float)
+    if extra_noise:
+        photo += np.random.default_rng(0).normal(0.0, extra_noise, photo.shape)
+    out[:rows] = np.clip(np.rint(photo), 0, 255).astype(np.uint8)
+    return out
+
+
+@pytest.mark.parametrize("base_noise,extra_noise", [(1.0, 3.0), (0.5, 1.0), (0.7, 0.0)])
+def test_randomness_noisy_banner_over_flat_page_is_clean(base_noise, extra_noise):
+    """Regression: a random leading region whose content is just noisier must
+    not be reported as a sequential encrypted payload. (1.0, 3.0) is the
+    reported case; the low-noise banners defeat bit-plane comparisons with
+    the text page, which is why the region is checked with SPA instead."""
+    page = page_with_photo_banner(base_noise, extra_noise)
+    res = detectors.run_all(page)
+    r = res["lsb_randomness"]
+    d = r["details"]
+    assert d["sequential_random_region"] is True  # the profile is there...
+    assert d["sequential_context"] is False       # ...but nothing supports a payload
+    assert d["leading_context"]["spa_rate"] < 0.1
+    assert r["score"] <= 0.3 and r["verdict"] == "clean"
+    assert "payload likely." not in r["summary"]
+    assert d["payload_hint"].endswith("if a payload is present")
+    assert detectors.combine_results(res)["verdict"] == "clean"
+
+
+def test_randomness_sequential_payload_on_stretched_cover_is_flagged(covers):
+    """A comb-histogram cover has structured LSBs without a smooth bit-1
+    plane; the region's SPA estimate is what supports the payload."""
+    r = detectors.run("lsb_randomness", embed_lsb(covers["stretched"], 0.25, "seq"))
+    d = r["details"]
+    assert d["sequential_random_region"] is True
+    assert d["leading_context"]["smooth_score"] < 0.65
+    assert d["leading_context"]["spa_rate"] > 0.8
+    assert d["sequential_context"] is True
+    assert r["verdict"] == "likely_stego"
+    assert "Encrypted or compressed payload likely." in r["summary"]
+
+
+def test_randomness_sequential_two_bit_payload_is_flagged(covers):
+    """Two bits per sample randomize bit 1 as well; SPA still sees the LSBs."""
+    n_bytes = covers["smooth"].size // 4 // 4  # 25% of the samples, 2 bits each
+    data = np.random.default_rng(11).integers(0, 256, n_bytes, dtype=np.uint8).tobytes()
+    r = detectors.run("lsb_randomness", write_bytes_lsb(covers["smooth"], data, bits_per_sample=2))
+    d = r["details"]
+    assert d["sequential_random_region"] is True
+    assert d["leading_random_fraction"] == pytest.approx(0.25, abs=1 / 16)
+    assert d["sequential_context"] is True
+    assert r["verdict"] == "likely_stego"
+
+
+def test_randomness_leading_context_skips_spa_on_tiny_region(covers):
+    arr = covers["smooth"]
+    h, w, c = arr.shape
+    ctx = rand_mod._leading_context(arr, [], 2 * w * c)  # two rows: too few pairs
+    assert ctx["region_rows"] == 2
+    assert ctx["spa_rate"] is None and ctx["spa_rates"] == []
+    assert ctx["spa_score"] == 0.0
+    assert ctx["support"] == ctx["smooth_score"]
+
+
 # --------------------------------------------------------------------------- #
 # Signatures
 # --------------------------------------------------------------------------- #
@@ -443,6 +626,19 @@ def test_signatures_finds_plain_stga_frame(covers):
     assert stga["body_len"] == len(body)
     assert stga["crc_ok"] is True
     assert stga["preview"] == body.decode()
+
+
+def test_signatures_checks_version_2_crc_over_header_prefix(covers):
+    """payload.pack writes version 2: the CRC covers header bytes 0-9 + body."""
+    body = b"Version two frames protect the flags byte with the CRC."
+    prefix = b"STGA" + bytes([2, 0]) + len(body).to_bytes(4, "big")
+    good = prefix + (zlib.crc32(prefix + body) & 0xFFFFFFFF).to_bytes(4, "big") + body
+    stga = detectors.run("signatures", write_bytes_lsb(covers["natural"], good))["details"]["stga"]
+    assert stga["version"] == 2 and stga["crc_ok"] is True and stga["score"] == 1.0
+    # A body-only CRC (the version 1 rule) does not validate a version 2 header.
+    bad = prefix + (zlib.crc32(body) & 0xFFFFFFFF).to_bytes(4, "big") + body
+    stga = detectors.run("signatures", write_bytes_lsb(covers["natural"], bad))["details"]["stga"]
+    assert stga["crc_ok"] is False and stga["score"] == 0.9
 
 
 def test_signatures_parses_flags_without_reading_encrypted_body(covers):
@@ -487,6 +683,35 @@ def test_signatures_reads_legacy_text_message(covers):
     assert best["kind"] == "text" and best["end_marker"] is True
     assert best["preview"] == msg
     assert r["verdict"] == "likely_stego"
+
+
+def test_signatures_ignores_one_or_two_bytes_before_zero_marker():
+    # Sparse LSBs (dark regions) make "<1-2 printable bytes> + 8 zero bytes"
+    # by chance; a lone 0x20 is a single set bit. Regression: this used to
+    # score 0.45 ("readable text + legacy 64-bit end marker").
+    for lead in (b" ", b"@", b"A0", b"  "):
+        assert sig_mod._scan_text("RGB", lead + bytes(32)) == [], lead
+    # Repetitive 3-byte runs are not text either.
+    assert sig_mod._scan_text("RGB", b"   " + bytes(32)) == []
+
+
+def test_signatures_short_legacy_message_with_marker_still_found(covers):
+    arr = write_bytes_lsb(covers["natural"], b"Hi!" + b"\0" * 8)
+    best = detectors.run("signatures", arr)["details"]["findings"][0]
+    assert best["kind"] == "text" and best["end_marker"] is True
+    assert best["preview"] == "Hi!" and best["score"] == 0.45
+
+
+def test_signatures_clean_dark_noisy_cover_is_clean():
+    # The cover that triggered the regression above: near-black content plus
+    # sigma 0.7 noise, so most LSBs are 0 and the RGB stream starts " " + zeros.
+    a = natural_cover(34).astype(float) * 0.05 - 1.0
+    a = a + np.random.default_rng(34).normal(0, 0.7, a.shape)
+    a = np.clip(np.rint(a), 0, 255).astype(np.uint8)
+    assert sig_mod.lsb_bytes(a, [0, 1, 2], n_bytes=9) == b" " + bytes(8)  # the trap is armed
+    r = detectors.run("signatures", a)
+    assert r["details"]["findings"] == [] and r["verdict"] == "clean"
+    assert detectors.combine_results(detectors.run_all(a))["verdict"] == "clean"
 
 
 def test_parse_stga_header_rejects_bad_input():

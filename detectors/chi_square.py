@@ -40,15 +40,42 @@ LSB pairs look equalized *and* its control pairs are clearly unbalanced
 (``p_control < CONTROL_ALPHA``). On a cover that is smooth everywhere the
 detector reports "inconclusive" with score 0 rather than a false alarm.
 
+How the run ends matters (heuristic interpretation, recorded per stream as
+``ended_by`` and ``estimate_kind``):
+
+* The LSB pairs of the next prefix are unbalanced again. Only this
+  *locates* the end of the payload, and the run length is reported as an
+  estimate of the payload size (``"located"``). The cumulative test lags
+  behind the true end, more so on covers whose natural pair imbalances are
+  weak, so the estimate tends to be too high.
+* The control pairs of the next prefix are balanced as well (or a p-value
+  is undefined). The test is merely inconclusive beyond that point: the
+  payload may continue past it, and on a smooth cover the run may also
+  have overshot the payload (see the next point), so the run length is not
+  a size estimate (``"open"``).
+* Every prefix counts. The control guard can be fooled by the payload
+  itself: equalizing the pairs of a smooth histogram leaves a staircase at
+  the pair boundaries that unbalances the shifted control pairs, so on a
+  smooth cover the cumulative control stays "informative" long after the
+  payload has ended, while the clean remainder's pairs are balanced anyway;
+  a 25% payload can then run on to the end of the stream. Such a run is
+  only called a full-stream payload (``"whole_stream"``) when the last
+  ``TAIL_FRACTION`` of the stream, tested on its own, also looks embedded;
+  otherwise it is ``"open"`` too.
+
+When choosing the stream that reports the estimate, located and
+whole-stream runs win over open ones, whatever their length.
+
 Limits: the attack needs the payload to be packed at the start of the
 stream. A payload scattered over the image with a key barely changes any
 prefix until nearly every sample is used. Biased payloads (plain text is
 about 45% one-bits) equalize pairs less and weaken the signal. On covers
-with smooth histograms even full embedding can go undetected (see above);
-the SPA and RS estimators do not share that weakness.
+with smooth histograms even full embedding can go undetected, and the
+length of a sequential payload often cannot be estimated (see above); the
+SPA and RS estimators do not share that weakness.
 
-Score (heuristic, from the estimated sequential fraction f of the
-strongest stream):
+Score (heuristic, from the run length f of the selected stream, chosen as
+described above):
     f = 0          ->  0.0   (clean)
     f = 5%         ->  0.25  (one prefix only, can be chance)
     f = 10%        ->  0.45  (suspicious)
@@ -77,6 +104,10 @@ P_THRESHOLD = 0.5
 CONTROL_ALPHA = 0.01
 # Minimum expected count per category (standard chi-square rule of thumb).
 MIN_EXPECTED = 5.0
+# Fraction of the stream, at its end, tested on its own to certify a run that
+# reaches the end of the stream (heuristic, see docstring). A sequential
+# payload that does not fill the stream never reaches this tail.
+TAIL_FRACTION = 0.2
 # Estimated sequential fraction -> score (heuristic thresholds, see docstring).
 SCORE_KNOTS = ((0.0, 0.0), (0.05, 0.25), (0.10, 0.45), (0.20, 0.70), (0.50, 0.90), (1.0, 1.0))
 
@@ -160,29 +191,171 @@ def prefix_curve(stream: np.ndarray,
     return out
 
 
-def leading_fraction(curve: list[dict[str, Any]], threshold: float = P_THRESHOLD,
-                     control_alpha: float = CONTROL_ALPHA) -> float:
-    """Length of the leading run of prefixes that look embedded.
+def _finite(x: Any) -> bool:
+    """True for a real, finite number (False for None and NaN)."""
+    return x is not None and bool(np.isfinite(x))
+
+
+def leading_run(curve: list[dict[str, Any]], threshold: float = P_THRESHOLD,
+                control_alpha: float = CONTROL_ALPHA) -> dict[str, Any]:
+    """Leading run of prefixes that look embedded, and what ended it.
 
     A prefix counts when its LSB pairs look equalized (``p > threshold``)
     while its shifted control pairs are clearly unbalanced
     (``p_control < control_alpha``). The control condition is what keeps a
     cover with a smooth histogram, whose pairs are balanced with no payload
-    at all, from counting as embedded. Undefined p-values end the run.
+    at all, from counting as embedded.
+
+    Args:
+        curve: Output of ``prefix_curve``.
+        threshold: ``p`` above which the LSB pairs count as equalized.
+        control_alpha: ``p_control`` below which the control pairs count as
+            unbalanced.
+
+    Returns:
+        Dict with ``fraction`` (the largest prefix fraction such that every
+        prefix up to it counts; 0.0 if the first prefix does not) and
+        ``ended_by``, the reason the run stopped:
+
+        * ``"pairs_unbalanced"``: the LSB pairs of the next prefix are
+          unbalanced again, as in a clean image. Only this locates the end
+          of a sequential payload.
+        * ``"control_balanced"``: the LSB pairs still look equalized but the
+          control pairs are balanced too, so the test cannot tell payload
+          from a smooth cover past this point (inconclusive, not an end).
+        * ``"undefined"``: a p-value of the next prefix is undefined (too
+          few categories).
+        * ``"end_of_stream"``: every prefix counts.
+    """
+    best = 0.0
+    for pt in curve:
+        p, pc = pt["p"], pt.get("p_control", 0.0)
+        if not _finite(p):
+            return {"fraction": best, "ended_by": "undefined"}
+        if p <= threshold:
+            return {"fraction": best, "ended_by": "pairs_unbalanced"}
+        if not _finite(pc):
+            return {"fraction": best, "ended_by": "undefined"}
+        if pc >= control_alpha:
+            return {"fraction": best, "ended_by": "control_balanced"}
+        best = pt["fraction"]
+    return {"fraction": best, "ended_by": "end_of_stream"}
+
+
+def leading_fraction(curve: list[dict[str, Any]], threshold: float = P_THRESHOLD,
+                     control_alpha: float = CONTROL_ALPHA) -> float:
+    """Length of the leading run of prefixes that look embedded.
+
+    Shorthand for ``leading_run(curve, threshold, control_alpha)["fraction"]``;
+    use ``leading_run`` to also learn why the run ended.
 
     Returns:
         The largest prefix fraction such that every prefix up to it counts,
         or 0.0 if the first prefix does not.
     """
-    best = 0.0
-    for pt in curve:
-        p, pc = pt["p"], pt.get("p_control", 0.0)
-        if p is None or not np.isfinite(p) or p <= threshold:
-            break
-        if pc is None or not np.isfinite(pc) or pc >= control_alpha:
-            break
-        best = pt["fraction"]
-    return best
+    return leading_run(curve, threshold, control_alpha)["fraction"]
+
+
+def tail_test(stream: np.ndarray, tail_fraction: float = TAIL_FRACTION,
+              threshold: float = P_THRESHOLD,
+              control_alpha: float = CONTROL_ALPHA) -> dict[str, Any]:
+    """Pair test on the last part of a stream on its own (not cumulative).
+
+    A run of embedded-looking prefixes that reaches the end of the stream
+    can be an artefact: the payload's own staircase keeps the cumulative
+    control pairs unbalanced while a smooth clean remainder keeps the LSB
+    pairs balanced. The end of the stream, which a sequential payload that
+    does not fill the stream never reaches, is therefore tested separately.
+
+    Args:
+        stream: 1-D uint8 array in embedding order.
+        tail_fraction: Fraction of the stream, at its end, to test.
+        threshold: As in ``leading_run``.
+        control_alpha: As in ``leading_run``.
+
+    Returns:
+        Dict with ``samples``, ``p``, ``p_control`` (NaN when undefined) and
+        ``state``: ``"embedded"`` (LSB pairs equalized, control pairs
+        unbalanced), ``"unbalanced"`` (LSB pairs unbalanced, as in a clean
+        image), ``"smooth"`` (both balanced: the tail cannot be judged) or
+        ``"undefined"``.
+    """
+    s = np.asarray(stream, dtype=np.uint8).ravel()
+    start = s.size - int(round(float(tail_fraction) * s.size))
+    hist = np.bincount(s[start:], minlength=256)
+    p = pair_chi_square(hist)["p"]
+    pc = pair_chi_square(hist, offset=1)["p"]
+    if not _finite(p):
+        state = "undefined"
+    elif p <= threshold:
+        state = "unbalanced"
+    elif not _finite(pc):
+        state = "undefined"
+    elif pc < control_alpha:
+        state = "embedded"
+    else:
+        state = "smooth"
+    return {"samples": int(s.size - start), "p": p, "p_control": pc, "state": state}
+
+
+def estimate_kind(run: dict[str, Any], tail: dict[str, Any]) -> str:
+    """How far a stream's run length can be read as a payload size.
+
+    Args:
+        run: Output of ``leading_run``.
+        tail: Output of ``tail_test`` for the same stream.
+
+    Returns:
+        ``"none"`` (no run), ``"located"`` (the LSB pairs became unbalanced
+        again: the run length estimates the payload size), ``"whole_stream"``
+        (every prefix counts and the tail looks embedded on its own) or
+        ``"open"`` (the run stopped for another reason, or reached the end
+        with a tail that does not look embedded: the test is inconclusive
+        beyond the run and the run length is not a size estimate).
+    """
+    if run["fraction"] <= 0:
+        return "none"
+    if run["ended_by"] == "pairs_unbalanced":
+        return "located"
+    if run["ended_by"] == "end_of_stream" and tail["state"] == "embedded":
+        return "whole_stream"
+    return "open"
+
+
+def _summary(f_hat: float, stream: str, kind: str, ended_by: str,
+             tail: dict[str, Any]) -> str:
+    """One-sentence summary for a non-empty run (``f_hat > 0``)."""
+    tail_pct = f"{TAIL_FRACTION:.0%}"
+    if kind == "located":
+        return (f"Pairs of values are equalized over the first {f_hat:.0%} of the {stream} "
+                f"stream, then unbalanced; consistent with a sequential payload of about "
+                f"that size.")
+    if kind == "whole_stream":
+        return (f"Pairs of values are equalized over the whole {stream} stream (p > "
+                f"{P_THRESHOLD} at every prefix, and the last {tail_pct} looks embedded on "
+                f"its own); consistent with LSB embedding in every sample.")
+    if ended_by == "end_of_stream":
+        if tail["state"] == "unbalanced":
+            why = (f"the last {tail_pct} of it has unbalanced pairs on its own, as in a clean "
+                   f"image, so the payload probably ends earlier, but the test cannot locate "
+                   f"where")
+        elif tail["state"] == "smooth":
+            why = (f"the last {tail_pct} of it has balanced control pairs as well, so a "
+                   f"clean smooth tail cannot be told apart from an embedded one")
+        else:
+            why = f"the last {tail_pct} of it is too small to test on its own"
+        return (f"Pairs of values look equalized at every prefix of the {stream} stream, "
+                f"but {why}; a sequential payload is likely, its size is not estimated.")
+    cause = ("the control pairs are balanced as well" if ended_by == "control_balanced"
+             else "the test is undefined")
+    text = (f"Pairs of values are equalized over the first {f_hat:.0%} of the {stream} "
+            f"stream, but beyond that {cause}, so the attack is inconclusive beyond "
+            f"{f_hat:.0%}: it does not locate the end of the payload, and {f_hat:.0%} is "
+            f"not a size estimate.")
+    if tail["state"] == "embedded":
+        text += (f" The last {tail_pct} of the stream also looks embedded on its own, so "
+                 f"the payload may fill the stream.")
+    return text
 
 
 @register(NAME, "Chi-square attack on pairs of values (Westfeld & Pfitzmann 1999) over "
@@ -197,8 +370,12 @@ def chi_square(arr: np.ndarray,
 
     Returns:
         Result dict in the shared detector schema. ``details`` holds the
-        p-value curve per stream, the estimated sequential fraction per
-        stream and the stream that produced the score.
+        p-value curve per stream, the run length per stream with the reason
+        each run ended, the tail test per stream and the stream that
+        produced the score. ``estimated_sequential_fraction`` is the run
+        length of that stream; ``estimate_kind`` says whether it is a size
+        estimate (``"located"``, ``"whole_stream"``) or only the point past
+        which the test is inconclusive (``"open"``).
     """
     a = as_channels(arr)
     labels = channel_labels(a.shape[2], channel_names)
@@ -209,16 +386,27 @@ def chi_square(arr: np.ndarray,
         streams[lab] = a[:, :, i].reshape(-1)
 
     curves = {}
-    fractions = {}
+    runs = {}
+    tails = {}
+    kinds = {}
     for name, stream in streams.items():
         curve = prefix_curve(stream)
         curves[name] = curve
-        fractions[name] = leading_fraction(curve)
+        runs[name] = leading_run(curve)
+        tails[name] = tail_test(stream)
+        kinds[name] = estimate_kind(runs[name], tails[name])
+    fractions = {k: r["fraction"] for k, r in runs.items()}
 
-    best = max(fractions, key=lambda k: fractions[k])
-    f_hat = fractions[best]
-    score = interp_score(f_hat, SCORE_KNOTS)
+    # Streams whose run length is a size estimate (the end was located, or a
+    # full-stream run is backed by its tail) outrank open runs, whose length
+    # may only reflect where a smooth histogram hides the payload's end.
     primary = next(iter(streams))
+    sized = [k for k in streams if kinds[k] in ("located", "whole_stream")]
+    pool = sized or [k for k in streams if fractions[k] > 0] or [primary]
+    best = max(pool, key=lambda k: fractions[k])
+    f_hat = fractions[best]
+    kind = kinds[best]
+    score = interp_score(f_hat, SCORE_KNOTS)
     p_full = curves[primary][-1]["p"]
     p_control_full = curves[primary][-1]["p_control"]
     informative = {k: bool(c[-1]["p_control"] is not None and np.isfinite(c[-1]["p_control"])
@@ -234,16 +422,18 @@ def chi_square(arr: np.ndarray,
     elif f_hat <= 0:
         summary = ("Pairs of values are unbalanced from the first prefix on, as in a natural "
                    "image; no sequential LSB payload found.")
-    elif f_hat >= 1.0:
-        summary = (f"Pairs of values are equalized over the whole {best} stream "
-                   f"(p > {P_THRESHOLD} at every prefix); consistent with LSB embedding in every sample.")
     else:
-        summary = (f"Pairs of values are equalized over the first {f_hat:.0%} of the {best} stream, "
-                   f"then unbalanced; consistent with a sequential payload of about that size.")
+        summary = _summary(f_hat, best, kind, runs[best]["ended_by"], tails[best])
     details = {
         "estimated_sequential_fraction": f_hat,
+        "estimate_kind": kind,
+        "run_ended_by": runs[best]["ended_by"],
         "stream": best,
         "per_stream_fraction": fractions,
+        "per_stream_ended_by": {k: r["ended_by"] for k, r in runs.items()},
+        "per_stream_estimate_kind": kinds,
+        "tail_fraction": TAIL_FRACTION,
+        "tail": tails,
         "p_full": p_full,
         "p_control_full": p_control_full,
         "informative": informative,

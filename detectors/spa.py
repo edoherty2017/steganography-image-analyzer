@@ -27,19 +27,48 @@ noise when nearly every sample is embedded) the vertex ``-b / 2a`` is used.
 
 The estimate is the fraction of samples that carry message bits (1.0 means
 every LSB was replaced with a payload bit), not the fraction that changed.
-Natural covers give estimates scattered around 0 with a spread of a few
-hundredths; the estimate is accurate when the payload bits are random-looking
-and spread over the image, and still tracks the overall fraction for a
-sequential (top-of-image) embedding.
+It is accurate when the payload bits are random-looking and spread over the
+image at random positions, which is what the model assumes.
 
-Score (heuristic, applied to the largest per-channel estimate):
+Sequential payloads. When the payload fills the first rows (this project's
+default without a password) the model does not hold: the two samples of
+almost every pair are either both embedded or both untouched, and the
+pooled quadratic reads low. The bias is large on smooth covers. On
+``test-images/smoothBlue.png`` (480x270) payloads filling 25%, 50% and 90%
+of capacity read 0.14, 0.31 and 0.69 (mean over channels) when written
+sequentially, against about 0.25, 0.50 and 0.90 when scattered. On the
+noisier 256x256 synthetic test covers a sequential 0.50 reads 0.44 to 0.49.
+The detector therefore also estimates the top and bottom halves of the image
+(``_rates.row_halves``). When the top half reads much higher it reports a
+sequential pattern and labels the estimate a lower bound (``details
+["lower_bound"]``). This label does not change the score. The check is a
+heuristic that needs a large gap between the halves. It misses short
+payloads (10% of capacity on smoothBlue.png), and it can never fire at
+64x64, where a half is too small for any gap to count.
+
+Score (heuristic, applied to the largest per-channel estimate), for images
+of 256x256 or more:
     estimate <= 0.05 ->  score 0.0
     estimate 0.12    ->  score 0.35         (suspicious from here)
     estimate 0.20    ->  score 0.65         (likely_stego from here)
     estimate >= 0.40 ->  score 1.0
-On 120 clean synthetic covers (gradients, smooth scenes, stretched and noisy
-variants) the largest per-channel estimate was at most 0.10; covers with
-strong noise on wide gradients give the largest clean estimates.
+For a smaller image every knot is multiplied by ``sqrt(REF_PAIRS / pairs)``
+(``_rates.knot_scale``: x2 at 128x128, x4 at 64x64), because the spread of
+the estimate on a clean cover grows as ``1 / sqrt(pairs)``.
+
+Calibration (heuristic; synthetic covers only). There were 20 seeds of each of
+five cover families from the test suite: wide gradients plus noise (conftest
+``synthetic_rgb``), smooth natural-looking scenes, a low-noise variant, a
+contrast-stretched variant, and noiseless low-contrast content. On these, the
+standard deviation of the clean per-channel estimate was about
+``c / sqrt(pairs)``. ``c`` was 5 to 8.5 for the wide-gradient covers, which are
+the noisiest, and at most 5 for the others. The largest clean per-channel
+estimate was 0.09 at 256x256, 0.21 at 128x128 and 0.41 at 64x64. With
+unscaled knots, 14 of the 20 wide-gradient covers at 64x64 read suspicious or
+likely_stego. With the scaled knots, none of the clean covers of any family
+reads above clean at 64, 96, 128, 192 or 256 pixels square. The cost is
+sensitivity on small images: at 64x64 a scattered payload must cover about
+half of the samples to read suspicious, and about 80% to read likely_stego.
 """
 from __future__ import annotations
 
@@ -49,14 +78,22 @@ import numpy as np
 
 from . import register
 from ._common import as_channels, channel_labels, interp_score, make_result, solve_quadratic_small_root
+from ._rates import REFERENCE_SIDE, knot_scale, rate_summary, row_halves, scale_knots
 
 NAME = "sample_pair_analysis"
 
-# Estimated embedding rate -> score (heuristic thresholds, see docstring).
+# Estimated embedding rate -> score at 256x256 and larger (heuristic
+# thresholds, see docstring); scaled up for smaller images.
 SCORE_KNOTS = ((0.05, 0.0), (0.12, 0.35), (0.20, 0.65), (0.40, 1.0))
-# Below this many horizontal pairs per channel the estimate is too noisy to
-# report (about a 32x32 image).
-MIN_PAIRS = 1000
+# Rate at which the unscaled score reaches "likely_stego".
+LIKELY_RATE = 0.20
+# Horizontal pairs per channel of a 256x256 image, where SCORE_KNOTS hold.
+REF_PAIRS = REFERENCE_SIDE * (REFERENCE_SIDE - 1)
+# Below this many horizontal pairs per channel (about a 64x64 image, which
+# has 64 * 63 = 4032) the knot scale passes 4, so the "likely_stego" knot
+# would sit above an estimate of 0.8 and the result says inconclusive
+# instead.
+MIN_PAIRS = 4000
 
 
 def spa_counts(channel: np.ndarray) -> dict[str, int]:
@@ -117,7 +154,11 @@ def sample_pair_analysis(arr: np.ndarray,
 
     Returns:
         Result dict in the shared detector schema. ``details`` holds the
-        per-channel estimates, their mean and max, and the pair counts.
+        per-channel estimates, their mean and max, the pair counts, the
+        size-scaled score knots (``score_knots``, with ``knot_scale`` and
+        the unscaled ``base_score_knots``), the top/bottom half estimates
+        (``row_halves``) and ``lower_bound`` (True when the payload looks
+        sequential, so the estimate is likely low).
     """
     a = as_channels(arr)
     labels = channel_labels(a.shape[2], channel_names)
@@ -125,7 +166,7 @@ def sample_pair_analysis(arr: np.ndarray,
     if n_pairs < MIN_PAIRS:
         return make_result(NAME, 0.0,
                            f"Inconclusive: {n_pairs} pixel pairs per channel is too few for sample "
-                           f"pair analysis (needs {MIN_PAIRS}).",
+                           f"pair analysis (needs {MIN_PAIRS}, about a 64x64 image).",
                            {"inconclusive": True, "pairs": n_pairs, "min_pairs": MIN_PAIRS})
     per_channel = {}
     for i, lab in enumerate(labels):
@@ -137,9 +178,13 @@ def sample_pair_analysis(arr: np.ndarray,
     max_rate = max(rates)
     mean_rate = float(np.mean(rates))
     top = max(per_channel, key=lambda k: per_channel[k]["rate"] if np.isfinite(per_channel[k]["rate"]) else -1)
-    score = interp_score(max_rate, SCORE_KNOTS)
-    summary = (f"Estimated LSB embedding rate {max_rate:.1%} (channel {top}); "
-               f"mean over channels {mean_rate:.1%}.")
+    factor = knot_scale(n_pairs, REF_PAIRS)
+    knots = scale_knots(SCORE_KNOTS, factor)
+    score = interp_score(max_rate, knots)
+    halves = row_halves(a, lambda ch: spa_estimate(ch)["rate"],
+                        lambda rows, width: rows * max(width - 1, 0), REF_PAIRS, LIKELY_RATE)
+    lower_bound = bool(halves is not None and halves["sequential"])
+    summary = rate_summary(max_rate, top, mean_rate, factor, n_pairs, "pairs", halves)
     details = {
         "estimated_rate": max_rate,
         "mean_rate": mean_rate,
@@ -147,6 +192,11 @@ def sample_pair_analysis(arr: np.ndarray,
         "per_channel_rate": {k: v["rate"] for k, v in per_channel.items()},
         "channels": per_channel,
         "pairs": "horizontal neighbours",
-        "score_knots": SCORE_KNOTS,
+        "pairs_per_channel": n_pairs,
+        "knot_scale": factor,
+        "score_knots": knots,
+        "base_score_knots": SCORE_KNOTS,
+        "row_halves": halves,
+        "lower_bound": lower_bound,
     }
     return make_result(NAME, score, summary, details)

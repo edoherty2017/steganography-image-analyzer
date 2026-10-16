@@ -27,13 +27,29 @@ payload when the image gives a reason to expect structure there:
   flagged ``likely_stego``.
 * A sequential payload. The stream is cut into 16 chunks; if the leading
   chunks pass the tests and the rest of the stream clearly fails them, the
-  random region is reported as a payload of about that length.
+  random region is a candidate payload of about that length. That profile
+  alone is not evidence: a noisy photo banner above a flat page or text
+  body has it too. The region must also give a reason to expect structure,
+  checked on the region itself: either its bit-1 plane is smooth (the test
+  above, on the leading chunks), or sample pair analysis (Dumitrescu, Wu &
+  Wang 2003) of the region's full rows estimates a high LSB embedding rate
+  (full support from 0.6, ``SPA_REGION_KNOTS``). SPA is a context test
+  here, not a second verdict: a payload
+  that fills the region shows up as a rate near 1 there (also when it uses
+  two bits per sample), while clean noisy content stays near 0. Bit-1
+  smoothness alone is not enough, because covers with a comb-shaped
+  histogram (contrast-stretched or otherwise edited photos) have structured
+  LSBs without a smooth bit-1 plane; comparing bit-plane correlations with
+  the rest of the image does not work either, since a flat page with text
+  has low bit-plane correlations from glyph edges, not from noise. Without
+  that context the region scores 0.3 like the whole-plane case.
 
-A random LSB plane with no such context scores 0.3 (verdict ``clean``) and
-sets ``details["random_lsb"]``: on its own it cannot separate photo noise
-from a payload. Whenever the random region is attributed to a payload, the
-summary adds "encrypted or compressed payload likely", since text and
-other uncompressed data would fail the tests.
+A random LSB plane or region with no such context scores 0.3 (verdict
+``clean``) and sets ``details["random_lsb"]`` (whole plane) or
+``details["sequential_random_region"]`` (leading region): on its own it
+cannot separate photo noise from a payload. Whenever the random region is
+attributed to a payload, the summary adds "encrypted or compressed payload
+likely", since text and other uncompressed data would fail the tests.
 """
 from __future__ import annotations
 
@@ -45,6 +61,7 @@ from scipy.stats import chi2 as chi2_dist
 
 from . import register
 from ._common import as_channels, channel_labels, interp_score, make_result
+from .spa import spa_estimate
 
 NAME = "lsb_randomness"
 
@@ -58,6 +75,15 @@ MIN_BITS = 3072
 CONTEXT_KNOTS = ((0.3, 0.3), (0.6, 0.85))
 # Leading random fraction (sequential payload) -> score.
 LEADING_KNOTS = ((1 / 16, 0.45), (2 / 16, 0.6), (4 / 16, 0.75), (1.0, 0.85))
+# SPA embedding-rate estimate on the random leading region -> how far it
+# supports a sequential payload there. Heuristic: on the synthetic covers, the
+# test images and noisy photo banners above flat pages, clean regions estimate
+# at most about 0.1 and regions filled with random payload bits (1 or 2 bits
+# per sample) at least about 0.85.
+SPA_REGION_KNOTS = ((0.3, 0.3), (0.6, 0.85))
+# Fewer horizontal pairs per channel than this in the region's full rows and
+# the SPA context is not computed (its estimate is too noisy).
+MIN_REGION_PAIRS = 1000
 
 
 def bit_stream_stats(bits: np.ndarray) -> dict[str, Any]:
@@ -169,7 +195,10 @@ def lsb_randomness(arr: np.ndarray,
     Returns:
         Result dict in the shared detector schema. ``details`` holds the
         stream statistics, per-channel LSB and bit-1 neighbour correlations,
-        the chunk profile and the ``random_lsb`` / ``payload_hint`` flags.
+        the chunk profile (with each chunk's bit-1 lag correlation), the
+        ``leading_context`` of a sequential random region (None when there is
+        none) and the ``random_lsb`` / ``sequential_random_region`` /
+        ``sequential_context`` / ``payload_hint`` flags.
     """
     a = as_channels(arr)
     h, w, c = a.shape
@@ -202,16 +231,20 @@ def lsb_randomness(arr: np.ndarray,
     bit1_context = float(np.mean(finite_bit1)) if finite_bit1 else float("nan")
 
     # Chunk profile in embedding order; lag = channels -> same channel, next pixel.
+    # The bit-1 stream in the same order tells how smooth each chunk's content is.
+    bit1_stream = ((a.reshape(-1) >> 1) & 1).astype(np.uint8)
     chunks = []
     bounds = np.linspace(0, stream.size, N_CHUNKS + 1).astype(int)
     for k in range(N_CHUNKS):
-        seg = stream[bounds[k]:bounds[k + 1]]
+        lo, hi = bounds[k], bounds[k + 1]
+        seg = stream[lo:hi]
         st = bit_stream_stats(seg)
         corr = lag_correlation(seg, c) if seg.size > c else float("nan")
-        chunks.append({"start": int(bounds[k]), "end": int(bounds[k + 1]),
+        chunks.append({"start": int(lo), "end": int(hi),
                        "entropy": st["entropy"], "monobit_z": st["monobit_z"],
                        "runs_z": st["runs_z"], "byte_chi2_p": st["byte_chi2_p"],
                        "lag_corr": corr,
+                       "bit1_lag_corr": lag_correlation(bit1_stream[lo:hi], c),
                        "random": bool(seg.size >= 64 and looks_random(st, corr, max(seg.size - c, 1)))})
     leading = 0
     for ch in chunks:
@@ -222,6 +255,7 @@ def lsb_randomness(arr: np.ndarray,
     rest_fail = (sum(1 for ch in rest if not ch["random"]) / len(rest)) if rest else 0.0
     sequential = bool(0 < leading < N_CHUNKS and rest_fail >= 0.75)
     leading_fraction = leading / N_CHUNKS
+    context = _leading_context(a, chunks[:leading], int(bounds[leading])) if sequential else None
 
     hint = None
     if random_lsb:
@@ -236,11 +270,26 @@ def lsb_randomness(arr: np.ndarray,
             summary = ("LSB plane is statistically random: typical of a noisy photo, and also what "
                        "an encrypted or compressed payload looks like; not evidence on its own.")
     elif sequential:
-        score = interp_score(leading_fraction, LEADING_KNOTS)
-        hint = "encrypted or compressed payload likely"
-        summary = (f"The first {leading_fraction:.0%} of the LSB stream is statistically random "
-                   f"while the rest is structured: consistent with a sequentially embedded payload. "
-                   f"Encrypted or compressed payload likely.")
+        support = context["support"]
+        score = min(interp_score(leading_fraction, LEADING_KNOTS), support)
+        if support >= 0.65:
+            hint = "encrypted or compressed payload likely"
+            summary = (f"The first {leading_fraction:.0%} of the LSB stream is statistically random "
+                       f"while the rest is structured: consistent with a sequentially embedded "
+                       f"payload. Encrypted or compressed payload likely.")
+        else:
+            hint = "encrypted or compressed payload likely, if a payload is present"
+            rate = context["spa_rate"]
+            if rate is None:
+                why = ("that region is too small for sample pair analysis and its bit-1 plane is "
+                       "not smooth")
+            else:
+                why = (f"sample pair analysis of that region estimates an LSB embedding rate of "
+                       f"only {rate:.0%} (a payload filling it would show close to 100%)")
+            summary = (f"The first {leading_fraction:.0%} of the LSB stream is statistically random "
+                       f"while the rest is structured, but {why}: noisier content there, such as a "
+                       f"photo above flat graphics, explains the random LSBs as well as a payload "
+                       f"would; " + ("not evidence on its own." if score < 0.35 else "weak evidence."))
     else:
         score = 0.0
         summary = (f"LSB plane is structured (entropy {overall['entropy']:.3f} bits/byte, monobit "
@@ -255,8 +304,59 @@ def lsb_randomness(arr: np.ndarray,
         "bit1_neighbour_corr_mean": bit1_context,
         "sequential_random_region": sequential,
         "leading_random_fraction": leading_fraction,
+        "sequential_context": bool(context is not None and context["support"] >= 0.65),
+        "leading_context": context,
         "chunks": chunks,
         "thresholds": {"z_max": Z_MAX, "byte_p_min": BYTE_P_MIN,
-                       "context_knots": CONTEXT_KNOTS, "leading_knots": LEADING_KNOTS},
+                       "context_knots": CONTEXT_KNOTS, "leading_knots": LEADING_KNOTS,
+                       "spa_region_knots": SPA_REGION_KNOTS,
+                       "min_region_pairs": MIN_REGION_PAIRS},
     }
     return make_result(NAME, score, summary, details)
+
+
+def _leading_context(a: np.ndarray, leading: list[dict[str, Any]],
+                     n_samples: int) -> dict[str, Any]:
+    """Whether a random leading region gives a reason to expect structure.
+
+    Heuristic, see the module docstring. Two scores are computed on the
+    region alone and the larger one is the support for a payload there:
+
+    * ``smooth_score``: ``CONTEXT_KNOTS`` applied to the mean bit-1 lag
+      correlation of the leading chunks (the whole-plane test, restricted to
+      the region); 0.3 to 0.85.
+    * ``spa_score``: ``SPA_REGION_KNOTS`` applied to the sample pair analysis
+      (Dumitrescu, Wu & Wang 2003) embedding-rate estimate of the region's
+      full rows, averaged over channels; 0.3 to 0.85, or 0.0 when those rows
+      hold fewer than ``MIN_REGION_PAIRS`` horizontal pairs per channel.
+
+    Args:
+        a: ``(H, W, C)`` uint8 image array.
+        leading: Chunk dicts of the random leading region (with
+            ``bit1_lag_corr``).
+        n_samples: Length of the region in samples (row-major pixels,
+            channels interleaved).
+
+    Returns:
+        Dict with ``leading_bit1_corr``, ``region_rows``, ``region_pairs``
+        (per channel), ``spa_rates`` (per channel, empty when not computed),
+        ``spa_rate`` (their mean, None when not computed), ``smooth_score``,
+        ``spa_score`` and ``support``.
+    """
+    h, w, c = a.shape
+    b1 = [ch["bit1_lag_corr"] for ch in leading if np.isfinite(ch["bit1_lag_corr"])]
+    lead1 = float(np.mean(b1)) if b1 else float("nan")
+    smooth_score = interp_score(lead1, CONTEXT_KNOTS)
+
+    # Only full rows: SPA counts horizontal pairs, and the region may end mid-row.
+    rows = min(h, n_samples // (w * c))
+    pairs = rows * (w - 1)
+    rates: list[float] = []
+    if pairs >= MIN_REGION_PAIRS:
+        rates = [spa_estimate(a[:rows, :, i])["rate"] for i in range(c)]
+    finite = [r for r in rates if np.isfinite(r)]
+    spa_rate = float(np.mean(finite)) if finite else None
+    spa_score = interp_score(spa_rate, SPA_REGION_KNOTS) if spa_rate is not None else 0.0
+    return {"leading_bit1_corr": lead1, "region_rows": int(rows), "region_pairs": int(pairs),
+            "spa_rates": rates, "spa_rate": spa_rate, "smooth_score": smooth_score,
+            "spa_score": spa_score, "support": max(smooth_score, spa_score)}

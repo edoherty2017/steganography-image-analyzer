@@ -37,14 +37,38 @@ discriminant (sampling noise near full embedding) uses the vertex.
 ``F-1`` maps 0 to -1 and 255 to 256; the groups are evaluated on signed
 integers so those out-of-range values only enter ``f`` and never wrap.
 
-Score (heuristic, applied to the largest per-channel estimate):
+Like sample pair analysis, RS assumes the embedded samples are spread over
+the image at random. A sequential payload in the first rows (this project's
+default without a password) breaks that assumption, and the whole-image
+estimate reads low. The bias is large on smooth covers. On
+``test-images/smoothBlue.png`` payloads filling 25%, 50% and 90% of capacity
+read 0.14, 0.30 and 0.69 (mean over channels) when written sequentially,
+against about 0.25, 0.50 and 0.90 when scattered. The detector also
+estimates the top and bottom halves of the image (``_rates.row_halves``).
+When the top half reads much higher it labels the estimate a lower bound
+(``details["lower_bound"]``). The label does not change the score. As in
+``spa.py``, this is a heuristic that misses short payloads and never fires
+at 64x64.
+
+Score (heuristic, applied to the largest per-channel estimate), for images
+of 256x256 or more:
     estimate <= 0.05 ->  score 0.0
     estimate 0.12    ->  score 0.35         (suspicious from here)
     estimate 0.20    ->  score 0.65         (likely_stego from here)
     estimate >= 0.40 ->  score 1.0
-On 120 clean synthetic covers (gradients, smooth scenes, stretched and noisy
-variants) the largest per-channel estimate was at most 0.10; covers with
-strong noise on wide gradients give the largest clean estimates.
+For a smaller image every knot is multiplied by ``sqrt(REF_GROUPS / groups)``
+(``_rates.knot_scale``: x2 at 128x128, x4 at 64x64), because the spread of
+the estimate on a clean cover grows as ``1 / sqrt(groups)``.
+
+Calibration (heuristic; synthetic covers only). There were 20 seeds of each
+of the five cover families described in ``spa.py``. On these, the standard
+deviation of the clean per-channel estimate was about ``c / sqrt(groups)``.
+``c`` was 4 to 5 for the wide-gradient covers, which are the noisiest, and at
+most 3 for the others. The largest clean per-channel estimate was 0.10 at
+256x256, 0.25 at 128x128 and 0.30 at 64x64. With unscaled knots, 11 of the
+20 wide-gradient covers at 64x64 read suspicious or likely_stego. With the
+scaled knots, one wide-gradient cover at 128x128 reads suspicious and every
+other clean cover reads clean at 64, 96, 128, 192 and 256 pixels square.
 """
 from __future__ import annotations
 
@@ -54,15 +78,22 @@ import numpy as np
 
 from . import register
 from ._common import as_channels, channel_labels, interp_score, make_result
+from ._rates import REFERENCE_SIDE, knot_scale, rate_summary, row_halves, scale_knots
 
 NAME = "rs_analysis"
 MASK = (0, 1, 1, 0)
 
-# Estimated embedding rate -> score (heuristic thresholds, see docstring).
+# Estimated embedding rate -> score at 256x256 and larger (heuristic
+# thresholds, see docstring); scaled up for smaller images.
 SCORE_KNOTS = ((0.05, 0.0), (0.12, 0.35), (0.20, 0.65), (0.40, 1.0))
-# Below this many 4-pixel groups per channel the estimate is too noisy to
-# report (about a 32x32 image).
-MIN_GROUPS = 250
+# Rate at which the unscaled score reaches "likely_stego".
+LIKELY_RATE = 0.20
+# 4-pixel groups per channel of a 256x256 image, where SCORE_KNOTS hold.
+REF_GROUPS = REFERENCE_SIDE * (REFERENCE_SIDE // len(MASK))
+# Below this many 4-pixel groups per channel (about a 64x64 image, which has
+# 64 * 16 = 1024) the knot scale passes 4, so the "likely_stego" knot would
+# sit above an estimate of 0.8 and the result says inconclusive instead.
+MIN_GROUPS = 1000
 
 
 def _flip_pos(x: np.ndarray) -> np.ndarray:
@@ -202,15 +233,20 @@ def rs_analysis(arr: np.ndarray,
 
     Returns:
         Result dict in the shared detector schema. ``details`` holds the
-        per-channel estimates, their mean and max, and the R/S fractions.
+        per-channel estimates, their mean and max, the R/S fractions, the
+        size-scaled score knots (``score_knots``, with ``knot_scale`` and
+        the unscaled ``base_score_knots``), the top/bottom half estimates
+        (``row_halves``) and ``lower_bound`` (True when the payload looks
+        sequential, so the estimate is likely low).
     """
     a = as_channels(arr)
     labels = channel_labels(a.shape[2], channel_names)
-    n_groups = a.shape[0] * (a.shape[1] // len(MASK))
+    n = len(MASK)
+    n_groups = a.shape[0] * (a.shape[1] // n)
     if n_groups < MIN_GROUPS:
         return make_result(NAME, 0.0,
                            f"Inconclusive: {n_groups} pixel groups per channel is too few for RS "
-                           f"analysis (needs {MIN_GROUPS}).",
+                           f"analysis (needs {MIN_GROUPS}, about a 64x64 image).",
                            {"inconclusive": True, "groups": n_groups, "min_groups": MIN_GROUPS})
     per_channel = {lab: rs_estimate(a[:, :, i]) for i, lab in enumerate(labels)}
     rates = [r["rate"] for r in per_channel.values() if np.isfinite(r["rate"])]
@@ -220,9 +256,13 @@ def rs_analysis(arr: np.ndarray,
     max_rate = max(rates)
     mean_rate = float(np.mean(rates))
     top = max(per_channel, key=lambda k: per_channel[k]["rate"] if np.isfinite(per_channel[k]["rate"]) else -1)
-    score = interp_score(max_rate, SCORE_KNOTS)
-    summary = (f"Estimated LSB embedding rate {max_rate:.1%} (channel {top}); "
-               f"mean over channels {mean_rate:.1%}.")
+    factor = knot_scale(n_groups, REF_GROUPS)
+    knots = scale_knots(SCORE_KNOTS, factor)
+    score = interp_score(max_rate, knots)
+    halves = row_halves(a, lambda ch: rs_estimate(ch)["rate"],
+                        lambda rows, width: rows * (width // n), REF_GROUPS, LIKELY_RATE)
+    lower_bound = bool(halves is not None and halves["sequential"])
+    summary = rate_summary(max_rate, top, mean_rate, factor, n_groups, "groups", halves)
     details = {
         "estimated_rate": max_rate,
         "mean_rate": mean_rate,
@@ -230,6 +270,11 @@ def rs_analysis(arr: np.ndarray,
         "per_channel_rate": {k: v["rate"] for k, v in per_channel.items()},
         "channels": per_channel,
         "mask": list(MASK),
-        "score_knots": SCORE_KNOTS,
+        "groups_per_channel": n_groups,
+        "knot_scale": factor,
+        "score_knots": knots,
+        "base_score_knots": SCORE_KNOTS,
+        "row_halves": halves,
+        "lower_bound": lower_bound,
     }
     return make_result(NAME, score, summary, details)
