@@ -11,12 +11,14 @@ differences
 then summarizes them with the L1 norm, the L2 norm, the median |Delta_k|, the
 largest |Delta_k|, and the pair index k where that maximum occurs.
 
-Why even/odd pairs: the embedders (encoder.py, and make_all.py's own
-embed_bits_rgb, which produced the images in results/) write the message bits
+Why even/odd pairs: the legacy embedder (make_all.py's classic mode,
+embed_bits_rgb, which produced the images in results/) writes the message bits
 followed by a 64-zero-bit delimiter, one bit into the least significant bit
 of each R, G, B byte in raster order from the top-left pixel (3 bits per
-pixel), and stop as soon as that stream ends. Pixels past the end are left
-unchanged. Replacing the LSB can only move a value between 2k and 2k+1, never
+pixel), and stops as soon as that stream ends. Pixels past the end are left
+unchanged. (encoder.py now writes an STGA frame instead of the delimiter
+format, in the same R, G, B LSB order, so the statistics behave the same
+way.) Replacing the LSB can only move a value between 2k and 2k+1, never
 into a different pair. If the payload bits are close to uniform, each pair's
 two counts drift toward each other over the changed pixels, so |Delta_k| (and
 its norms) tends to shrink at high embedding rates. A short message changes
@@ -31,8 +33,9 @@ How it fits with the other modules:
     main.py                  CLI front end for encode/decode.
     steganalysis.py          Plots of the standard and pairwise histograms.
     pairwise_stats.py        This module: the numbers (JSON + LaTeX table).
-    make_all.py              Experiment runner; calls this script through
-                             subprocess for each cover/stego pair it builds.
+    make_all.py              Experiment runner; its classic mode imports
+                             chan_hist, pair_stats, latex_table and
+                             default_caption for each cover/stego pair.
     gui.py                   Tkinter app (does not call this module).
 
 Usage (from the repo root):
@@ -141,6 +144,20 @@ def pair_stats(h: np.ndarray) -> dict:
         "max_k": int(a.argmax())
     }
 
+CHANNEL_NAMES = ("red", "green", "blue")
+
+def default_caption(ch: int) -> str:
+    """Return the default LaTeX caption for a channel index.
+
+    Args:
+        ch: Channel index (0=R, 1=G, 2=B), as returned by ``parse_channel``.
+
+    Returns:
+        ``"Pairwise even/odd statistics (<name> channel)."`` with the name of
+        the channel that was actually analyzed.
+    """
+    return f"Pairwise even/odd statistics ({CHANNEL_NAMES[ch]} channel)."
+
 def latex_table(Sc: dict, Ss: dict, caption: str) -> str:
     """Format cover and stego pair statistics as a LaTeX table.
 
@@ -156,17 +173,17 @@ def latex_table(Sc: dict, Ss: dict, caption: str) -> str:
 
     Returns:
         The LaTeX source of the table, with rows for Original, Encoded, and
-        the change in L1, L2 and median |Delta_k|.
+        the change (Encoded minus Original) in L1, L2 and median |Delta_k|.
     """
-    # The "*_drop" values are cover minus stego, so a positive value means that
-    # statistic is smaller for the stego image. The signs can disagree across
-    # statistics (full-high in results/: L1 rises while L2 falls).
-    # NOTE: the table row below is labelled "Change (E$-$O)" (Encoded minus
-    # Original), but these values are Original minus Encoded, so the printed
-    # signs are inverted (e.g. Encoded L1 36924 vs Original 19786 prints -17138).
-    L1_drop = Sc["L1"] - Ss["L1"]
-    L2_drop = Sc["L2"] - Ss["L2"]
-    Med_drop = Sc["median_abs"] - Ss["median_abs"]
+    # The "Change (E-O)" row is Encoded minus Original, so a positive value
+    # means that statistic grew in the stego image (e.g. Encoded L1 36924 vs
+    # Original 19786 prints +17138). This is the opposite sign of the JSON
+    # "*_drop" fields, which are Original minus Encoded. The signs can
+    # disagree across statistics (full-high in results/: L1 rises while L2
+    # falls).
+    L1_change = Ss["L1"] - Sc["L1"]
+    L2_change = Ss["L2"] - Sc["L2"]
+    Med_change = Ss["median_abs"] - Sc["median_abs"]
     return r"""
 \begin{table}[H]\centering
 \caption{%s}
@@ -184,7 +201,7 @@ Change (E$-$O) & %+d & %+0.3f & %+0.3f & -- & -- \\
 """ % (caption,
        Sc["L1"], Sc["L2"], Sc["median_abs"], Sc["max_abs"], Sc["max_k"],
        Ss["L1"], Ss["L2"], Ss["median_abs"], Ss["max_abs"], Ss["max_k"],
-       L1_drop, L2_drop, Med_drop)
+       L1_change, L2_change, Med_change)
 
 if __name__ == "__main__":
     # CLI entry point. Side effects: prints the JSON result to stdout, and
@@ -197,12 +214,15 @@ if __name__ == "__main__":
                    help="Channel r/g/b or 0/1/2 (default: b)")
     p.add_argument("--json", help="Write results to JSON")
     p.add_argument("--latex", help="Write LaTeX table to this path")
-    # NOTE: the default caption always says "blue channel", even when -c
-    # selects red or green.
-    p.add_argument("--caption", default="Pairwise even/odd statistics (blue channel).",
-                   help="Caption for LaTeX table")
+    # The default caption is filled in after parsing, so it names the channel
+    # that -c actually selected.
+    p.add_argument("--caption", default=None,
+                   help="Caption for LaTeX table (default: "
+                        "'Pairwise even/odd statistics (<channel> channel).')")
     p.add_argument("--tag", default=None, help="Optional tag echoed into JSON object")
     args = p.parse_args()
+    if args.caption is None:
+        args.caption = default_caption(args.channel)
 
     Hc, size_c = chan_hist(args.cover, args.channel)
     Hs, size_s = chan_hist(args.stego, args.channel)
