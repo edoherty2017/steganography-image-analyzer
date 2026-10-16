@@ -5,8 +5,7 @@ Two experiments, both run in-process (every module is imported directly; no
 subprocesses, so the script works from any working directory and with any
 interpreter that has the dependencies):
 
-``classic``  The original three-case histogram experiment on one cover image,
-             unchanged in what it produces:
+``classic``  The original three-case histogram experiment on one cover image:
 
                A) full-low      Original size, short message (low rate).
                B) resized-high  Cover resized to --resize x --resize, then
@@ -18,6 +17,25 @@ interpreter that has the dependencies):
              delimiter in the R, G, B LSBs (row-major), then writes the
              steganalysis.analyze() histogram figures and the
              pairwise_stats.py even/odd statistics (JSON + LaTeX table).
+
+             Differences from the original script (commit a5a3774):
+
+             * Cases B and C cut the repeated message at a whole UTF-8
+               character (fit_text_bits) instead of at a bit, so the
+               delimiter stays byte-aligned and decoder.decode_legacy() can
+               read it back. Case A is never cut. The stego image is
+               pixel-identical to the original's when the message fits
+               without a cut, or when it is ASCII and the case's cover has a
+               W*H that is a multiple of 8 (as at the default 500x500 for
+               case B). Otherwise the payload ends up to 7 bits earlier
+               (more when a multi-byte character is split), the delimiter
+               moves up with it, the last few samples keep their cover
+               values, and that case's pairwise statistics differ slightly
+               (a handful of samples at the end of the stream).
+             * The pairwise captions name the analyzed channel; the original
+               always said "blue channel".
+             * The default --out is results/ in the repository, not
+               results/ under the current working directory.
 
 ``detection`` A detection-curve experiment for the blind detectors in
              ``detectors/``. For each cover and each embedding rate it hides
@@ -50,7 +68,8 @@ Usage (any working directory)::
 
     python make_all.py classic COVER [--out results] [--resize 500]
                        [--channel b] [--short "message"] [--long-multiplier 5000]
-    python make_all.py COVER ...                      # same as classic (old form)
+    python make_all.py COVER [options]                # same as classic (old form)
+    python make_all.py [options] COVER                # old form, options first
 
 Detection outputs, under ``--out/--tag`` (default results/experiments/<tag>)::
 
@@ -1275,16 +1294,114 @@ def run_detection(out_dir: str | os.PathLike, *, covers: Sequence | None = None,
 SUBCOMMANDS = ("classic", "detection")
 
 
-def _normalize_argv(argv: Sequence[str]) -> list[str]:
-    """Keep the old ``make_all.py COVER [options]`` form working.
+def _add_classic_arguments(c: argparse.ArgumentParser) -> list[argparse.Action]:
+    """Add the ``classic`` subcommand's arguments to a parser.
 
-    If the first argument is not a subcommand or an option, it is a cover
-    path for the classic experiment, so ``classic`` is inserted before it.
+    Shared by build_parser() and _normalize_argv(), so the old-form detection
+    always knows exactly which classic options take a value.
+
+    Args:
+        c: Parser to add the arguments to.
+
+    Returns:
+        list[argparse.Action]: The actions that were added.
+    """
+    return [
+        c.add_argument("cover", help="Path to the cover image"),
+        c.add_argument("--out", default=str(REPO_ROOT / "results"),
+                       help="Output directory (default: results/ in the repository)"),
+        c.add_argument("--resize", type=int, default=500,
+                       help="Side length of the square cover for case B (default 500)"),
+        c.add_argument("--channel", default="b", choices=["r", "g", "b"],
+                       help="Channel analysed (default b)"),
+        c.add_argument("--short", default=DEFAULT_SHORT, help="Message for case A"),
+        c.add_argument("--long-multiplier", type=int, default=5000,
+                       help="Repeats of the message for case B (case C uses 10x)"),
+    ]
+
+
+def _classic_options() -> tuple[set[str], set[str]]:
+    """Return ``(all_options, value_options)`` for the classic subcommand.
+
+    ``all_options`` holds every option string (``-h`` and ``--help``
+    included); ``value_options`` the ones that consume the next argument.
+    """
+    probe = argparse.ArgumentParser(add_help=False)
+    actions = _add_classic_arguments(probe)
+    every = {"-h", "--help"}
+    takes_value: set[str] = set()
+    for action in actions:
+        every.update(action.option_strings)
+        if action.option_strings and action.nargs != 0:
+            takes_value.update(action.option_strings)
+    return every, takes_value
+
+
+def _first_positional(argv: Sequence[str]) -> int | None:
+    """Index of the first positional argument in a classic-style command line.
+
+    Options are skipped together with their value (``--out DIR``; the
+    ``--out=DIR`` form has none to skip). Unique prefixes of long options
+    count, as argparse accepts them (``--res 64`` is ``--resize 64``).
+    Everything after a bare ``--`` is positional.
+
+    Args:
+        argv: Command-line arguments without the program name.
+
+    Returns:
+        int | None: Index into ``argv``, or None if there is no positional
+        argument.
+    """
+    every, takes_value = _classic_options()
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return i + 1 if i + 1 < len(argv) else None
+        if not tok.startswith("-") or tok == "-":
+            return i
+        i += 1
+        if "=" in tok:
+            continue  # --opt=value carries its own value
+        if tok.startswith("--"):
+            matches = [o for o in every if o.startswith(tok)]
+            name = tok if tok in every else (matches[0] if len(matches) == 1 else None)
+        else:
+            name = tok
+        if name in takes_value:
+            i += 1  # skip the option's value
+    return None
+
+
+def _normalize_argv(argv: Sequence[str]) -> list[str]:
+    """Keep the old flat ``make_all.py [options] COVER [options]`` form working.
+
+    The original script had no subcommands: one positional cover path plus
+    options, in any order. If the first positional argument (skipping
+    options and their values) is not a subcommand name, the command line is
+    in that old form and ``classic`` is inserted in front of it. This also
+    covers options before the cover (``--out X --resize 64 cover.png``) and
+    option values that happen to equal a subcommand name
+    (``--short classic cover.png``).
+
+    An empty command line and a bare ``-h`` / ``--help`` are left alone so
+    argparse shows the top-level usage with both subcommands. Options with
+    no cover at all (``--out X``) become ``classic --out X``, so the error
+    names the missing cover, as the original script's did.
+
+    Args:
+        argv: Command-line arguments without the program name.
+
+    Returns:
+        list[str]: Arguments for build_parser().parse_args().
     """
     argv = list(argv)
-    if argv and argv[0] not in SUBCOMMANDS and not argv[0].startswith("-"):
-        argv.insert(0, "classic")
-    return argv
+    if not argv or argv in (["-h"], ["--help"]):
+        return argv
+    i = _first_positional(argv)
+    if i is not None and argv[i] in SUBCOMMANDS:
+        return argv
+    return ["classic", *argv]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1295,16 +1412,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="command", required=True)
 
     c = sub.add_parser("classic", help="Original three-case histogram experiment on one cover.")
-    c.add_argument("cover", help="Path to the cover image")
-    c.add_argument("--out", default=str(REPO_ROOT / "results"),
-                   help="Output directory (default: results/ in the repository)")
-    c.add_argument("--resize", type=int, default=500,
-                   help="Side length of the square cover for case B (default 500)")
-    c.add_argument("--channel", default="b", choices=["r", "g", "b"],
-                   help="Channel analysed (default b)")
-    c.add_argument("--short", default=DEFAULT_SHORT, help="Message for case A")
-    c.add_argument("--long-multiplier", type=int, default=5000,
-                   help="Repeats of the message for case B (case C uses 10x)")
+    _add_classic_arguments(c)
 
     d = sub.add_parser("detection", help="Detection curves for every registered detector.")
     d.add_argument("covers", nargs="*",

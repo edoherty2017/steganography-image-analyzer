@@ -354,6 +354,89 @@ def test_normalize_argv_keeps_old_form():
     assert make_all._normalize_argv(["-h"]) == ["-h"]
 
 
+@pytest.mark.parametrize("argv", [
+    # Regression: the original flat parser accepted options before the cover;
+    # these used to reach the subparser as "invalid choice: 'x'" (exit 2).
+    ["--out", "x", "--resize", "64", "cover.png"],
+    ["--out=x", "cover.png"],
+    ["--res", "64", "--long", "5", "cover.png"],  # argparse prefix abbreviations
+    ["--short", "classic", "cover.png"],          # a value equal to a subcommand name
+    ["--out", "x", "--", "cover.png"],
+])
+def test_normalize_argv_options_before_cover(argv):
+    norm = make_all._normalize_argv(argv)
+    assert norm == ["classic", *argv]
+    args = make_all.build_parser().parse_args(norm)
+    assert args.command == "classic" and args.cover == "cover.png"
+
+
+def test_normalize_argv_leaves_top_level_cases_alone():
+    assert make_all._normalize_argv([]) == []
+    assert make_all._normalize_argv(["--help"]) == ["--help"]
+    assert make_all._normalize_argv(["classic", "--out", "x", "c.png"]) == ["classic", "--out", "x", "c.png"]
+    # Options without a cover go to classic, so the error names the cover.
+    assert make_all._normalize_argv(["--out", "x"]) == ["classic", "--out", "x"]
+
+
+def test_classic_cli_options_before_cover(tmp_path, synthetic_rgb, save_png):
+    cover = save_png(synthetic_rgb(4, 32), "c.png")
+    out = tmp_path / "opts-first"
+    rc = make_all.main(["--out", str(out), "--resize", "16", "--long-multiplier", "5",
+                        str(cover)])
+    assert rc == 0
+    for case in ("full-low", "resized-high", "full-high"):
+        assert len(list(out.glob(f"c_*_{case}_enc.png"))) == 1
+
+
+def test_classic_cli_without_cover_names_it(capsys):
+    with pytest.raises(SystemExit) as exc:
+        make_all.main(["--out", "x"])
+    assert exc.value.code == 2
+    assert "required: cover" in capsys.readouterr().err
+
+
+def _original_cut_stego(cover: Path, out: Path, text: str) -> np.ndarray:
+    """Case C as the original script (a5a3774) embedded it: a bit-level cut."""
+    bits = make_all.to_bits_utf8(text)[:make_all.capacity_bits(str(cover)) - make_all.DELIM_BITS]
+    make_all.embed_bits_rgb(str(cover), str(out), bits)
+    return np.asarray(Image.open(out).convert("RGB")).reshape(-1)
+
+
+@pytest.mark.parametrize("w, h", [(24, 16), (21, 19)])
+def test_classic_full_high_vs_original_bit_cut(tmp_path, synthetic_rgb, save_png, w, h):
+    """The module docstring's claim about where classic differs from the original.
+
+    With ASCII text, case C is pixel-identical to the original's bit-level cut
+    when W*H is a multiple of 8 (24x16). Otherwise (21x19: 1197 samples,
+    1133 payload bits available) the message is cut to 1128 bits, the
+    delimiter ends 5 samples early, and only the last few samples differ.
+    """
+    cover = save_png(synthetic_rgb(3, 32)[:h, :w], "cv.png")
+    short, mult = "hi", 40
+    res = make_all.run_classic(str(cover), str(tmp_path / "run"), resize=16, short=short,
+                               long_multiplier=mult, rid="RID", log=_quiet)
+    case = res["cases"]["full-high"]
+    new = np.asarray(Image.open(case["stego"]).convert("RGB")).reshape(-1)
+    orig = _original_cut_stego(cover, tmp_path / "orig.png", (short + " ") * (mult * 10))
+    cov = np.asarray(Image.open(cover).convert("RGB")).reshape(-1)
+
+    n = 3 * w * h
+    avail = n - make_all.DELIM_BITS
+    payload = avail // 8 * 8  # whole bytes only
+    assert case["bits_written"] == payload + make_all.DELIM_BITS
+    if (w * h) % 8 == 0:
+        assert np.array_equal(new, orig)
+    else:
+        assert case["bits_written"] < n
+        # Same up to the byte-aligned cut; the samples past the shorter
+        # stream keep their cover values instead of the original's zeros.
+        assert np.array_equal(new[:payload], orig[:payload])
+        assert np.array_equal(new[case["bits_written"]:], cov[case["bits_written"]:])
+        assert not np.array_equal(new, orig)
+        assert np.flatnonzero(new != orig).min() >= payload
+    assert decoder.decode(case["stego"]) == ((short + " ") * (mult * 10))[:payload // 8]
+
+
 # --------------------------------------------------------------------------- #
 # pairwise_stats.py fixes
 # --------------------------------------------------------------------------- #

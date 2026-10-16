@@ -39,26 +39,33 @@ rates few values change, so cover and stego plots look nearly identical.
 
 How it fits with the other modules:
 
-* encoder.py / decoder.py: the LSB embed and extract routines used by main.py
-  and gui.py. Each RGB pixel carries 3 message bits (one per channel, in
-  raster order), so an image has 3 * width * height LSB slots. The message
-  is followed by a 64-zero-bit delimiter that takes 64 of those slots, and
-  encoder.py's capacity check rounds the slot count down to a multiple of 8.
-* main.py: command-line encode/decode front end (does not use this module).
+* encoder.py / stego.py: the LSB embedder. With 1 bit per sample and no
+  password, each RGB pixel carries 3 payload bits (one per channel, in
+  raster order), so an image has 3 * width * height LSB slots. The payload
+  is an STGA frame (payload.py): a 14-byte header (magic, version, flags,
+  body length, CRC-32) followed by the body, so the header takes 112 of
+  those slots and stego.capacity_bytes() is ``slots // 8 - 14``. Images
+  written by the original encoder (text followed by a 64-zero-bit
+  delimiter) are still read by decoder.py's legacy fallback.
+* main.py: command-line front end. ``main.py compare`` calls
+  ``analyze_comparison`` with its ``--channel`` and then prints the
+  pairwise_stats.py numbers for the same channel.
 * steganalysis.py (this file): the plots. ``analyze`` serves make_all.py,
-  which runs this file's CLI with ``--out`` in a subprocess.
-  ``analyze_comparison`` is imported and called directly by gui.py.
+  whose ``run_steganalysis`` imports this module and calls it in-process.
+  ``analyze_comparison`` serves gui.py's Compare tab and ``main.py
+  compare``. Its own CLI (below) is a convenience that neither caller uses.
 * pairwise_stats.py: the numeric counterpart for the same Delta_k values. It
   reports the L1 and L2 norms of Delta, the median and max of |Delta_k| and
   the k of that max. It always prints JSON to stdout and writes a JSON file
   or LaTeX table only with ``--json`` or ``--latex``.
-* make_all.py: experiment runner for three cases (full-size low-rate,
-  resized high-rate, full-size high-rate). It embeds UTF-8 text with its own
-  copy of the embed loop (it does not import encoder.py), then runs this
-  module and pairwise_stats.py for each case as ``python3 <script>`` by
-  relative path, so it must be run from the repository root.
-* gui.py: Tkinter app. Its full-analysis action encodes the message and then
-  calls ``analyze_comparison``.
+* make_all.py: experiment runner. Its ``classic`` experiment has three cases
+  (full-size low-rate, resized high-rate, full-size high-rate). It embeds
+  UTF-8 text plus the legacy 64-zero-bit delimiter with its own NumPy
+  embedder (it does not import encoder.py), then calls ``analyze`` and
+  pairwise_stats.py for each case. Everything runs in-process, so it works
+  from any working directory.
+* gui.py: Tkinter app. Its Compare tab calls ``analyze_comparison`` in a
+  background thread with the channel chosen in its Red/Green/Blue box.
 
 Usage (from the repository root)::
 
@@ -79,6 +86,8 @@ import matplotlib.pyplot as plt
 
 # Channel letter -> index along the last axis of an (H, W, 3) RGB array.
 CHANNELS = {"r":0, "g":1, "b":2}
+# Channel index -> name used in plot titles.
+CHANNEL_NAMES = ("Red", "Green", "Blue")
 
 def _load_rgb(path):
     """Load an image as an RGB uint8 array.
@@ -178,9 +187,9 @@ def _pairwise_hist(ax, chan_data, title, zoom=True, annotate_max=True):
 def analyze(cover_path:str, stego_path:str, out_dir:str=".", tag:str="", channel:str="b"):
     """Save cover-vs-stego histogram figures for one channel (make_all.py path).
 
-    make_all.py reaches this through the CLI (``--out``), not by import. The
-    two images are not checked to be the same size (pairwise_stats.py does
-    check).
+    make_all.run_steganalysis imports this module and calls this function
+    in-process, after rejecting channels other than r, g or b. The two images
+    are not checked to be the same size (pairwise_stats.py does check).
 
     Args:
         cover_path: Path to the original (cover) image.
@@ -262,8 +271,9 @@ def analyze(cover_path:str, stego_path:str, out_dir:str=".", tag:str="", channel
 def analyze_comparison(original_image_path, encoded_image_path, output_path=None, channel="b"):
     """Save a 2x2 cover-vs-stego composite plus four single plots (GUI path).
 
-    Called directly by gui.py's full-analysis action. Also reachable through
-    the CLI with ``-o``. The two images are not checked to be the same size.
+    Called by gui.py's Compare tab and by ``main.py compare``, both with the
+    channel the user chose. Also reachable through this file's CLI with
+    ``-o``. The two images are not checked to be the same size.
 
     Args:
         original_image_path: Path to the original (cover) image.
@@ -271,7 +281,9 @@ def analyze_comparison(original_image_path, encoded_image_path, output_path=None
         output_path: Path for the composite image. If None, uses
             "comparison_analysis.png" in the encoded image's directory.
         channel: "r", "g" or "b" (case-insensitive). Unknown values fall back
-            to blue. gui.py never passes it, so the GUI always analyzes blue.
+            to blue. The composite's suptitle and all four single-plot titles
+            name the channel actually analyzed, e.g. "(Red Channel)", so a
+            fallback is labeled "(Blue Channel)".
 
     Returns:
         dict mapping "composite", "p1", "p2", "p3" and "p4" to the paths
@@ -292,6 +304,9 @@ def analyze_comparison(original_image_path, encoded_image_path, output_path=None
         FileNotFoundError: If either image path does not exist.
     """
     ch = CHANNELS.get(channel.lower(), 2)
+    # Titles are derived from the resolved index, not the string passed in,
+    # so they always name the channel whose data is plotted.
+    label = f"({CHANNEL_NAMES[ch]} Channel)"
     cov = _load_rgb(original_image_path)
     ste = _load_rgb(encoded_image_path)
     # Keep one channel and flatten (H, W) to a 1-D array of values.
@@ -308,7 +323,7 @@ def analyze_comparison(original_image_path, encoded_image_path, output_path=None
     _std_hist(axs[0,1], ste_c, "2. Encoded Image: Standard Histogram")
     _pairwise_hist(axs[1,0], cov_c, "3. Original Image: Difference Analysis")
     _pairwise_hist(axs[1,1], ste_c, "4. Encoded Image: Difference Analysis")
-    fig.suptitle("Comprehensive Steganalysis: Before vs. After")
+    fig.suptitle(f"Comprehensive Steganalysis: Before vs. After {label}")
     # rect leaves the top 5% of the figure free for the suptitle.
     fig.tight_layout(rect=[0,0,1,0.95]); fig.savefig(output_path, dpi=150); plt.close(fig)
 
@@ -318,19 +333,16 @@ def analyze_comparison(original_image_path, encoded_image_path, output_path=None
     p3 = os.path.join(out_dir, "3_original_difference_analysis.png")
     p4 = os.path.join(out_dir, "4_encoded_difference_analysis.png")
 
-    # NOTE: the four titles below always say "(Blue Channel)", even when
-    # channel is "r" or "g". The GUI always uses blue, so only the CLI
-    # (-o ... --channel r or g) and direct callers get a wrong title.
-    fig, ax = plt.subplots(figsize=(12, 8)); _std_hist(ax, cov_c, "Original Image: Standard Histogram (Blue Channel)")
+    fig, ax = plt.subplots(figsize=(12, 8)); _std_hist(ax, cov_c, f"Original Image: Standard Histogram {label}")
     fig.tight_layout(); fig.savefig(p1, dpi=150); plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(12, 8)); _std_hist(ax, ste_c, "Encoded Image: Standard Histogram (Blue Channel)")
+    fig, ax = plt.subplots(figsize=(12, 8)); _std_hist(ax, ste_c, f"Encoded Image: Standard Histogram {label}")
     fig.tight_layout(); fig.savefig(p2, dpi=150); plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(12, 8)); _pairwise_hist(ax, cov_c, "Original Image: Difference Analysis (Blue Channel)")
+    fig, ax = plt.subplots(figsize=(12, 8)); _pairwise_hist(ax, cov_c, f"Original Image: Difference Analysis {label}")
     fig.tight_layout(); fig.savefig(p3, dpi=150); plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(12, 8)); _pairwise_hist(ax, ste_c, "Encoded Image: Difference Analysis (Blue Channel)")
+    fig, ax = plt.subplots(figsize=(12, 8)); _pairwise_hist(ax, ste_c, f"Encoded Image: Difference Analysis {label}")
     fig.tight_layout(); fig.savefig(p4, dpi=150); plt.close(fig)
 
     return {"composite":output_path, "p1":p1, "p2":p2, "p3":p3, "p4":p4}
