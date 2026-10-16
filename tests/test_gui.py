@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
+import sys
 import threading
 import time
 import wave
@@ -87,12 +90,25 @@ def last_message(app) -> tuple[str, str, str]:
     return app.messages[-1]
 
 
-def legacy_image(arr: np.ndarray, text: str) -> np.ndarray:
-    """Embed text the original way: UTF-8 bits + 64 zero bits, row-major RGB LSBs."""
-    bits = bytes_to_bits(text.encode("utf-8") + b"\x00" * 8)
+def legacy_image(arr: np.ndarray, text: str | bytes) -> np.ndarray:
+    """Embed text the original way: its bytes + 64 zero bits, row-major RGB LSBs.
+
+    A str is stored as UTF-8; pass bytes for the original encoder's
+    single-byte (Latin-1) storage of code points 128-255.
+    """
+    raw = text.encode("utf-8") if isinstance(text, str) else text
+    bits = bytes_to_bits(raw + b"\x00" * 8)
     flat = arr.copy().reshape(-1)
     flat[: bits.size] = (flat[: bits.size] & 0xFE) | bits
     return flat.reshape(arr.shape)
+
+
+def dark_cover(synthetic_rgb, save_png, name: str = "dark.png") -> Path:
+    """A clean cover whose bottom half is black: its LSB stream holds the
+    legacy delimiter (8 zero bytes) after 12,288 bytes of LSB noise."""
+    arr = synthetic_rgb(11)
+    arr[128:] = 0
+    return save_png(arr, name)
 
 
 def write_wav(path: Path, seconds: float = 0.5, rate: int = 8000) -> Path:
@@ -398,6 +414,110 @@ def test_clean_image_and_missing_file_errors(app, cover, tmp_path):
     assert last_message(app)[0] == "warning"
 
 
+def test_legacy_text_heuristic_accepts_text_and_rejects_noise():
+    assert gui.legacy_text(b"") is None
+    assert gui.legacy_text(b"meet at noon\n") == ("meet at noon\n", "utf-8")
+    assert gui.legacy_text("café €".encode("utf-8")) == ("café €", "utf-8")
+    # The original encoder's single-byte storage of code points 128-255.
+    assert gui.legacy_text(b"caf\xe9 au lait") == ("café au lait", "latin-1")
+    assert gui.legacy_text(b"\x01\x02\x03ab") is None          # mostly control bytes
+    assert gui.legacy_text(b"}~") is None                      # no letter or digit
+    assert gui.legacy_text(b"STGA\x01\x00\x00\x00\x00\x0chello") is None  # a frame header
+    assert gui.legacy_text(b"\xff\xfe\xfd\xfcab") is None      # Latin-1 but mostly non-ASCII
+    noise = np.random.default_rng(0).integers(0, 256, 4096, dtype=np.uint8).tobytes()
+    assert gui.legacy_text(noise) is None
+
+
+def test_dark_clean_image_is_not_reported_as_a_legacy_message(app, synthetic_rgb, save_png):
+    path = dark_cover(synthetic_rgb, save_png)
+    # The delimiter is there, after LSB noise: the old fallback "decoded" it.
+    raw = gui.legacy_bytes(str(path))
+    assert raw is not None and len(raw) == 128 * 256 * 3 // 8
+    assert gui.legacy_text(raw) is None
+    with pytest.raises(stego.NoPayloadError, match="do not read as text"):
+        gui.decode_file(str(path))
+
+    dec = app.decode_tab
+    dec.decode(path)
+    pump(app)
+    assert dec.headline.cget("text") == "No hidden payload found"
+    assert dec.headline.cget("style") == "ErrorTitle.TLabel"
+    assert dec.found is None and dec.found_format is None
+    assert dec.save_button.instate(["disabled"])
+    assert last_message(app)[:2] == ("error", "No hidden payload found")
+
+
+def test_wrong_password_on_dark_cover_reports_no_payload_not_legacy(app, synthetic_rgb, save_png,
+                                                                     tmp_path):
+    out = tmp_path / "dark_stego.png"
+    stego.hide(dark_cover(synthetic_rgb, save_png), out, "meet at the docks at midnight",
+               password="correct horse")
+    dec = app.decode_tab
+    dec.password_var.set("wrong guess")
+    dec.decode(out)
+    pump(app)
+    assert dec.headline.cget("text") == "No hidden payload found"
+    assert dec.found is None
+    kind, title, text = last_message(app)
+    assert (kind, title) == ("error", "No hidden payload found")
+    assert "wrong password" in text and "clear the password" in text
+
+    dec.password_var.set("")
+    dec.decode(out)
+    pump(app)
+    assert dec.headline.cget("text") == "No hidden payload found"
+    assert dec.found is None
+
+    dec.password_var.set("correct horse")
+    dec.decode(out)
+    pump(app)
+    assert dec.recovered_text() == "meet at the docks at midnight"
+
+
+def test_forced_two_bits_on_one_bit_stego_points_to_auto(app, synthetic_rgb, save_png, tmp_path):
+    out = tmp_path / "onebit.png"
+    stego.hide(dark_cover(synthetic_rgb, save_png), out, "hello legacy", key_scatter=False)
+    dec = app.decode_tab
+    dec.bits_var.set("2")
+    dec.decode(out)
+    pump(app)
+    assert dec.headline.cget("text") == "No hidden payload found"
+    assert dec.found is None
+    text = last_message(app)[2]
+    assert "found at 1 bit(s) per sample" in text and "Auto" in text
+    dec.bits_var.set("Auto")
+    dec.decode(out)
+    pump(app)
+    assert dec.recovered_text() == "hello legacy"
+
+
+def test_legacy_byte_count_matches_the_saved_file(app, synthetic_rgb, save_png, tmp_path):
+    # A message in the legacy format on the dark cover is still found.
+    arr = legacy_image(np.asarray(Image.open(dark_cover(synthetic_rgb, save_png))),
+                       "legacy message ends in d")
+    path = save_png(arr, "legacy_dark.png")
+    dec = app.decode_tab
+    dec.decode(path)
+    pump(app)
+    assert dec.found_format == "legacy"
+    assert dec.recovered_text() == "legacy message ends in d"
+    n = len("legacy message ends in d")
+    assert dec.headline.cget("text") == f"Hidden message ({n} bytes)"
+    saved = Path(dec.save_recovered(tmp_path / "saved"))
+    assert saved.read_bytes() == b"legacy message ends in d"
+
+    # Original single-byte storage: shown and saved as UTF-8, counted as saved.
+    path = save_png(legacy_image(synthetic_rgb(1), b"caf\xe9 au lait"), "latin1.png")
+    dec.decode(path)
+    pump(app)
+    assert dec.recovered_text() == "café au lait"
+    assert "Latin-1" in dec.detail.cget("text")
+    size = len("café au lait".encode("utf-8"))
+    assert dec.headline.cget("text") == f"Hidden message ({size} bytes)"
+    saved = Path(dec.save_recovered(tmp_path / "saved"))
+    assert saved.read_bytes() == "café au lait".encode("utf-8")
+
+
 def test_missing_inputs_warn_instead_of_running(app):
     assert app.encode_tab.hide() is False
     assert app.decode_tab.decode() is False
@@ -650,7 +770,217 @@ def test_file_open_goes_to_the_current_tab(app, cover):
     assert app.callback_errors == []
 
 
-def test_import_switches_matplotlib_to_agg():
-    import matplotlib
+# ---------------------------------------------------------------------------
+# A result is never shown under another file chosen while its job ran
+# ---------------------------------------------------------------------------
 
-    assert matplotlib.get_backend().lower() == "agg"
+@pytest.fixture
+def a_and_b(cover, synthetic_rgb, save_png, tmp_path) -> tuple[Path, Path]:
+    """(A, B): a stego image with a long text frame, and a clean image."""
+    a = tmp_path / "A_stego.png"
+    stego.hide(cover, a, "SECRET-IN-A " * 30, key_scatter=False)
+    return a, save_png(synthetic_rgb(7), "B_clean.png")
+
+
+def assert_discarded(app, old: Path):
+    status = app.status.cget("text")
+    assert "discarded the result for " + old.name in status, status
+    assert app.callback_errors == []
+
+
+def test_decode_result_is_dropped_when_another_file_is_opened(app, a_and_b, tmp_path):
+    a, b = a_and_b
+    dec = app.decode_tab
+    app.notebook.select(dec)
+    assert dec.decode(a) is True
+    app.open_file(b)  # while the decode of A is still running
+    pump(app)
+    assert dec.path_var.get() == str(b)
+    assert dec.found is None and dec.recovered_text() is None
+    assert dec.headline.cget("text") == "Press Decode to look for a hidden payload."
+    assert dec.save_button.instate(["disabled"])
+    assert dec.save_recovered(tmp_path / "saved") is None
+    assert not (tmp_path / "saved").exists()
+    assert_discarded(app, a)
+
+    # A path typed into the entry counts too, and a later save is named
+    # after the decoded file, not after the entry.
+    dec.decode(a)
+    pump(app)
+    assert dec.recovered_text().startswith("SECRET-IN-A")
+    dec.path_var.set(str(b))
+    saved = Path(dec.save_recovered(tmp_path / "saved"))
+    assert saved.name == "A_stego_payload.txt"
+
+
+def test_decode_result_is_dropped_by_reset_all(app, a_and_b):
+    a, _b = a_and_b
+    dec = app.decode_tab
+    dec.decode(a)
+    app.reset_all()
+    pump(app)
+    assert dec.path_var.get() == ""
+    assert dec.found is None
+    assert dec.headline.cget("text") == "Choose a stego file and press Decode."
+    assert not app.messages  # no dialog for the dropped result either
+
+
+def test_analyze_result_is_dropped_when_another_file_is_opened(app, a_and_b):
+    a, b = a_and_b
+    tab = app.analyze_tab
+    tab.bruteforce_var.set(False)
+    app.notebook.select(tab)
+    assert tab.analyze(a) is True
+    # A second run while busy is refused without touching the input.
+    assert tab.analyze(b) is False
+    assert tab.path_var.get() == str(a)
+    app.open_file(b)
+    pump(app)
+    assert tab.path_var.get() == str(b)
+    assert tab.result is None
+    assert tab.banner.cget("text") == "No analysis yet"
+    assert tab.tree.get_children() == ()
+    assert tab.export_button.instate(["disabled"])
+    assert_discarded(app, a)
+
+
+def test_bruteforce_result_is_dropped_when_another_file_is_opened(app, a_and_b):
+    a, b = a_and_b
+    tab = app.bruteforce_tab
+    app.notebook.select(tab)
+    assert tab.run(a) is True
+    assert tab.run(b) is False
+    assert tab.path_var.get() == str(a)
+    app.open_file(b)
+    pump(app)
+    assert tab.path_var.get() == str(b)
+    assert tab.candidates == [] and tab.tree.get_children() == ()
+    assert tab.save_button.instate(["disabled"])
+    assert_discarded(app, a)
+
+
+def test_bitplanes_refuses_a_second_file_while_slicing(app, a_and_b):
+    a, b = a_and_b
+    tab = app.bitplanes_tab
+    app.notebook.select(tab)
+    assert tab.load(a) is True
+    app.open_file(b)  # refused: the input still shows A
+    assert tab.path_var.get() == str(a)
+    assert "still working" in app.status.cget("text")
+    pump(app)
+    assert tab.array is not None
+    assert "Bit planes of A_stego.png" in app.status.cget("text")
+
+    # A path typed while slicing makes the result stale.
+    tab.load(a)
+    tab.path_var.set(str(b))
+    pump(app)
+    assert tab.array is None and tab.view_grid.image is None
+    assert_discarded(app, a)
+
+
+def test_compare_and_encode_results_are_dropped_by_reset_all(app, cover, tmp_path):
+    full = tmp_path / "full.png"
+    stego.hide(cover, full, "x" * 2000, key_scatter=False)
+    app.compare_tab.compare(cover, full)
+    app.reset_all()
+    pump(app)
+    assert app.compare_tab.figure_path is None
+    assert app.compare_tab.view_hist.image is None
+
+    enc = app.encode_tab
+    enc.set_cover(cover)
+    pump(app)
+    enc.set_message("hidden, then reset")
+    out = tmp_path / "reset_during_hide.png"
+    enc.hide(out)
+    app.reset_all()
+    pump(app)
+    # The file is written and the user is told, but nothing is shown.
+    assert out.exists()
+    assert last_message(app)[:2] == ("info", "Saved")
+    assert "cover was changed" in last_message(app)[2]
+    assert enc.last_summary is None and enc.stego_path is None
+    assert enc.preview_stego.image is None
+    assert app.decode_tab.path_var.get() == ""
+    assert app.callback_errors == []
+
+
+# ---------------------------------------------------------------------------
+# Fill Max on a large cover, and saving over the cover
+# ---------------------------------------------------------------------------
+
+def test_fill_max_text_is_in_short_lines(app, synthetic_rgb, save_png):
+    # One capacity-sized line made Tk re-lay out megabytes per keystroke.
+    tab = app.encode_tab
+    tab.set_cover(save_png(synthetic_rgb(8, 512), "large.png"))
+    pump(app)
+    for bits in (1, 2):
+        tab.bits_var.set(bits)
+        app.fill_max_message()
+        message = tab.get_message()
+        room = tab.capacity[bits]
+        assert len(message) == len(message.encode("utf-8")) == room
+        assert tab.update_meter() == (room, room)
+        assert max(len(line) for line in message.split("\n")) <= gui.FILLER_LINE_WIDTH
+        assert message.startswith("Lorem ipsum dolor sit amet")
+    # The Tk widget agrees: many short display lines, not one huge one.
+    assert int(tab.message_text.index("end-1c").split(".")[0]) > room // (gui.FILLER_LINE_WIDTH + 1)
+
+
+def test_hide_refuses_to_overwrite_the_cover(app, cover, tmp_path):
+    original = cover.read_bytes()
+    tab = app.encode_tab
+    tab.set_cover(cover)
+    pump(app)
+    tab.set_message("A" * 2000)
+    for target in (cover, cover.parent / "sub" / ".." / cover.name):
+        (cover.parent / "sub").mkdir(exist_ok=True)
+        assert tab.hide(target) is False
+        assert not app.busy
+        assert last_message(app)[:2] == ("error", "Choose another file")
+        assert cover.read_bytes() == original
+        assert "Not saved" in tab.result_label.cget("text")
+        assert "pixels changed" not in tab.result_label.cget("text")
+    assert tab.stego_path is None
+
+    # A different file name still works.
+    out = tmp_path / "cover_encoded.png"
+    assert tab.hide(out) is True
+    pump(app)
+    assert out.exists() and cover.read_bytes() == original
+    # Some pixels changed (not "0 of"), out of the cover's 256 x 256.
+    assert re.search(r"\b[1-9][\d,]* of 65,536 pixels changed", tab.result_label.cget("text"))
+
+
+def test_import_switches_matplotlib_to_agg():
+    """Importing gui must switch Matplotlib to the file-only Agg backend.
+
+    gui.py calls ``matplotlib.use("Agg")`` because steganalysis.py imports
+    pyplot and the GUI draws figures on worker threads. An in-process check
+    cannot see that line go missing: tests/test_experiments.py calls
+    ``matplotlib.use("Agg")`` at module level (pytest collects every module
+    before running any test) and CI sets MPLBACKEND=Agg for the whole job.
+    So the import runs in a fresh interpreter, started on a backend that is
+    not Agg.
+
+    The child gets MPLBACKEND=template rather than no MPLBACKEND at all.
+    Without the variable, Matplotlib picks a backend itself, and on a
+    headless Linux runner it falls back to Agg anyway, so a gui.py without
+    the ``use("Agg")`` line would still pass. "template" ships with
+    Matplotlib, is non-interactive and needs no display.
+    """
+    code = (
+        "import sys, matplotlib\n"
+        "before = matplotlib.get_backend()\n"
+        "if before.lower() != 'template':\n"
+        "    sys.exit(f'precondition: backend before import is {before!r}')\n"
+        "import gui\n"
+        "after = matplotlib.get_backend()\n"
+        "sys.exit(0 if after.lower() == 'agg' else\n"
+        "         f'backend after import gui is {after!r}, expected Agg')\n"
+    )
+    env = {**os.environ, "MPLBACKEND": "template"}
+    proc = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr

@@ -11,14 +11,17 @@ has a toolbar, six tabs and a status bar:
                  whole cover), zlib compression and 1 or 2 bits per sample.
                  A live meter shows payload bytes against the cover's
                  capacity. The stego file is saved as PNG, BMP, TIFF or WAV
-                 only, and the tab previews the cover, the stego image and a
-                 mask of the pixels whose low bits changed.
+                 only (never over the cover itself), and the tab previews
+                 the cover, the stego image and a mask of the pixels whose
+                 low bits changed.
     Decode       Recover a hidden payload (stego.reveal). Text is shown in
                  the tab; a hidden file (or any payload) can be saved. Images
                  in the original delimiter format (text followed by 64 zero
-                 bits) are read by the legacy fallback. A wrong or missing
-                 password, no payload, and a damaged payload each get their
-                 own message.
+                 bits) are read by the legacy fallback when no password is
+                 given, and its result is shown only when it reads as text
+                 (a heuristic: the format has no header, so dark images
+                 "decode" to noise). A wrong or missing password, no
+                 payload, and a damaged payload each get their own message.
     Analyze      Runs report.analyze_image (every detector, STGA header
                  detection and brute force) in the background, then shows an
                  overall verdict banner, a table of detector results and the
@@ -48,7 +51,10 @@ function only computes: it receives plain values (paths, strings, numbers),
 never a widget, and returns plain values or PIL images. Its result or
 exception goes into a queue.Queue, and a root.after() poll on the Tk thread
 picks it up and updates the widgets. Tk is not thread-safe, so this is the
-only way results reach the UI. matplotlib is switched to the Agg backend
+only way results reach the UI. A tab's input can change while its job runs
+(File > Open, typing a path, Reset All); the job's callbacks compare the
+input with the path the job started with and drop a result that belongs to
+another file (ToolTab._is_stale). matplotlib is switched to the Agg backend
 before steganalysis (which uses pyplot) is imported, so figures can be drawn
 off the Tk thread; the GUI only shows them as saved PNGs.
 
@@ -59,7 +65,8 @@ How it fits with the other modules:
                        PayloadError); pack() sizes the capacity meter.
     carriers/          The plug-in registry: which file types can be covers
                        and outputs (it builds the file dialog filters).
-    decoder.py         decode_legacy(): the delimiter-format fallback.
+    decoder.py         The legacy delimiter format (LEGACY_DELIMITER_BYTES),
+                       read by legacy_bytes() here for the Decode fallback.
     report.py          analyze_image(), format_text(), write_report(): the
                        Analyze tab.
     detectors/         The statistical detectors behind report.py; listed in
@@ -92,6 +99,7 @@ import os
 import queue
 import re
 import sys
+import textwrap
 import threading
 import traceback
 import tkinter as tk
@@ -151,6 +159,30 @@ LOREM_IPSUM = (
     " esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in"
     " culpa qui officia deserunt mollit anim id est laborum. "
 )
+
+# Longest line of the Fill Max Space filler. A tk.Text lays out a line as a
+# whole, so a capacity-sized filler on one line (9 MB for a 12-megapixel
+# cover at 2 bits) froze the window for seconds per keystroke; in short lines
+# typing stays instant.
+FILLER_LINE_WIDTH = 76
+
+# LOREM_IPSUM broken into lines: textwrap swaps spaces for newlines one for
+# one, so the block is still ASCII and exactly as long as LOREM_IPSUM.
+FILLER_BLOCK = textwrap.fill(LOREM_IPSUM.strip(), FILLER_LINE_WIDTH) + "\n"
+
+# Legacy-format plausibility (see legacy_text()). Valid UTF-8 counts as text
+# when at least this share of its characters is printable, newline, CR or
+# tab: the rule report.py uses to call a payload text.
+LEGACY_MIN_PRINTABLE = 0.9
+
+# Bytes that are not valid UTF-8 are read as Latin-1 (the original encoder
+# stored code points 128-255 as single bytes) only when at least this share
+# is ASCII and every character is printable: bruteforce.py's legacy rule.
+LEGACY_MIN_ASCII_LATIN1 = 0.6
+
+# A Latin-1 character that is not printable text (C0/C1 controls, DEL, NBSP,
+# soft hyphen); tab, LF and CR are allowed.
+_LATIN1_NOT_TEXT = re.compile(r"[^\t\n\r\x20-\x7e\xa1-\xac\xae-\xff]")
 
 # How often (ms) the Tk thread checks whether a background job has finished.
 POLL_MS = 50
@@ -345,13 +377,99 @@ def frame_body_len(data: bytes, *, filename: str | None = None,
     return body + (stego.ENCRYPTION_OVERHEAD if encrypted else 0)
 
 
+def legacy_bytes(path: str) -> bytes | None:
+    """Read the raw bytes of a legacy delimiter-format message.
+
+    The same reading as decoder.decode_legacy(): the image converted to RGB,
+    the LSB of every R, G and B value in row-major order packed MSB-first
+    into bytes, cut at the first 8 zero bytes on a byte boundary. Unlike
+    decode_legacy() the bytes are returned before any text decoding, so
+    their count is exact and the caller can judge whether they are text.
+
+    Args:
+        path: The image.
+
+    Returns:
+        The bytes before the delimiter (b"" when the stream starts with
+        it), or None when there is no delimiter.
+
+    Raises:
+        FileNotFoundError, PIL.UnidentifiedImageError: As Image.open does.
+    """
+    with Image.open(path) as img:
+        rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    lsb = rgb.reshape(-1) & 1
+    # Whole bytes only: packbits would pad a partial last byte with zeros.
+    whole = lsb.size - lsb.size % 8
+    stream = np.packbits(lsb[:whole]).tobytes()
+    end = stream.find(decoder.LEGACY_DELIMITER_BYTES)
+    return None if end == -1 else stream[:end]
+
+
+def legacy_text(raw: bytes) -> tuple[str, str] | None:
+    """Decide whether legacy-format bytes read as a text message (heuristic).
+
+    The legacy format has no header and no checksum, and any 8 zero bytes in
+    the LSB stream look like its delimiter. Flat black or dark regions are
+    full of them, so on a clean image (or a payload read with the wrong
+    password or bit depth) the bytes in front of the first zero run are
+    LSB noise. They are reported as a message only when they look like
+    text:
+
+    * valid UTF-8 (strict) with at least LEGACY_MIN_PRINTABLE (90%) of the
+      characters printable, newline, CR or tab, the rule report.py uses to
+      call a payload text; or
+    * not valid UTF-8 but every byte printable Latin-1 and at least
+      LEGACY_MIN_ASCII_LATIN1 (60%) ASCII, bruteforce.py's rule for the
+      original encoder, which stored code points 128-255 as single bytes;
+    * and in both cases at least one letter or digit, so a few stray
+      printable bytes in front of a dark region are not called a message.
+
+    This is a heuristic filter, not a proof either way: noise from a natural
+    image fails it after a few bytes (only about 37% of random bytes are
+    printable ASCII, and invalid UTF-8 appears almost at once), but a very
+    short false hit can still pass.
+
+    Args:
+        raw: Bytes from legacy_bytes().
+
+    Returns:
+        (text, encoding) with encoding "utf-8" or "latin-1", or None when
+        the bytes are empty or do not read as text.
+    """
+    if not raw:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        codes = np.frombuffer(raw, dtype=np.uint8)
+        if np.count_nonzero(codes < 0x80) < LEGACY_MIN_ASCII_LATIN1 * codes.size:
+            return None
+        text = raw.decode("latin-1")
+        if _LATIN1_NOT_TEXT.search(text):
+            return None
+        encoding = "latin-1"
+    else:
+        printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+        if printable < LEGACY_MIN_PRINTABLE * len(text):
+            return None
+        encoding = "utf-8"
+    if not any(ch.isalnum() for ch in text):
+        return None
+    return text, encoding
+
+
 def decode_file(path: str, password: str | None = None, bits: int | None = None) -> dict[str, Any]:
     """Recover a hidden payload, falling back to the legacy text format.
 
-    Tries stego.reveal() first. Only when no STGA header is found at all
-    (NoPayloadError) in an image is the legacy reader tried; a wrong
-    password or a damaged frame is reported, never "repaired" by the
-    legacy reader. This is the same rule decoder.decode() and main.py use.
+    Tries stego.reveal() first. A wrong password or a damaged frame is
+    reported, never "repaired" by the legacy reader. Only when no STGA
+    header is found at all (NoPayloadError) in an image is the legacy
+    reader tried, and only when it can apply: the legacy format has no
+    password and uses 1 bit per sample, so it is skipped when a password is
+    given or 2 bits per sample are forced. Its result is accepted only when
+    it reads as text (legacy_text(), a heuristic), because the format has
+    no header and dark images "decode" to noise.
 
     Args:
         path: The stego file.
@@ -360,13 +478,18 @@ def decode_file(path: str, password: str | None = None, bits: int | None = None)
 
     Returns:
         {"format": "stga" or "legacy", "payload": payload.Payload,
-        "header": stego.probe() dict or None, "preview": PIL image or None}.
+        "header": stego.probe() dict or None, "preview": PIL image or None};
+        a legacy result also has "legacy_encoding" ("utf-8" or "latin-1")
+        and "legacy_bytes" (the stored byte count). The payload data is the
+        text as UTF-8, which is what the tab shows, counts and saves.
 
     Raises:
         FileNotFoundError: If ``path`` does not exist.
         payload.WrongPasswordError: Encrypted frame, password missing/wrong.
         stego.NoPayloadError: Nothing found (also a wrong password when the
-            payload was scattered with it).
+            payload was scattered with it). The message says whether the
+            legacy format was tried and, when ``bits`` was forced, whether
+            a frame exists at the other bit depth.
         payload.PayloadError: Damaged frame (CRC mismatch, cropped file).
     """
     if not os.path.isfile(path):
@@ -383,25 +506,46 @@ def decode_file(path: str, password: str | None = None, bits: int | None = None)
         except (OSError, UnidentifiedImageError):
             preview = None
 
-    not_found: Exception | None = None
+    reasons: list[str] = []
     if carrier_cls is not None:
         try:
             found = stego.reveal(path, password=password, bits=bits)
         except stego.NoPayloadError as exc:
             if not image:
                 raise
-            not_found = exc
+            reasons.append(str(exc))
         else:
             header = stego.probe(path, password=password, bits=bits)
             return {"format": "stga", "payload": found, "header": header, "preview": preview}
+        if bits is not None:
+            # A frame hidden at the other bit depth reads as nothing here.
+            other = stego.probe(path, password=password, bits=None)
+            if other is not None and other["bits_per_sample"] != bits:
+                reasons.append(f"but an STGA frame was found at {other['bits_per_sample']} "
+                               "bit(s) per sample: set Bits per sample to Auto")
+    else:
+        reasons.append(f"no hidden payload found in {path!r}")
 
-    text = decoder.decode_legacy(path)
-    if text:
-        return {"format": "legacy", "payload": payload.Payload(text.encode("utf-8")),
-                "header": None, "preview": preview}
-    if not_found is not None:
-        raise not_found
-    raise stego.NoPayloadError(f"no hidden payload found in {path!r}")
+    if password:
+        reasons.append("the legacy format (text followed by 64 zero bits) was not tried "
+                       "because it has no password: clear the password to try it")
+    elif bits == 2:
+        reasons.append("the legacy format (text followed by 64 zero bits) was not tried "
+                       "because it uses 1 bit per sample")
+    else:
+        raw = legacy_bytes(path)
+        hit = legacy_text(raw) if raw else None
+        if hit is not None:
+            text, encoding = hit
+            return {"format": "legacy", "payload": payload.Payload(text.encode("utf-8")),
+                    "header": None, "preview": preview,
+                    "legacy_encoding": encoding, "legacy_bytes": len(raw)}
+        if raw:
+            reasons.append("the bytes in front of the first 64 zero bits (the legacy "
+                           "format's delimiter) do not read as text")
+        else:
+            reasons.append("no legacy-format text (text followed by 64 zero bits) was found")
+    raise stego.NoPayloadError("; ".join(reasons))
 
 
 def hex_dump(data: bytes, limit: int = HEX_PREVIEW_BYTES) -> str:
@@ -430,6 +574,19 @@ def safe_stem(path: str) -> str:
     return stem or "image"
 
 
+def same_file(a: str | os.PathLike, b: str | os.PathLike) -> bool:
+    """True if ``a`` and ``b`` name the same existing file.
+
+    The operating system decides (os.path.samefile), so a different
+    spelling, letter case on a case-insensitive disk, ".." or a link all
+    count. If either file does not exist they cannot be the same file.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def describe_error(exc: BaseException) -> tuple[str, str]:
     """Turn an exception into a (title, message) pair a user can act on.
 
@@ -442,10 +599,11 @@ def describe_error(exc: BaseException) -> tuple[str, str]:
                 f"hidden with and try again.\n\nDetails: {exc}")
     if isinstance(exc, stego.NoPayloadError):
         return ("No hidden payload found",
-                "No payload header was found, and the legacy format (text followed "
-                "by 64 zero bits) was not found either. If the data was hidden with "
+                "No payload header was found, and no text in the legacy format (text "
+                "followed by 64 zero bits) was recognized. If the data was hidden with "
                 "a password and key scatter, the same password is needed to find "
-                f"it: a wrong password looks exactly like no payload.\n\nDetails: {exc}")
+                "it: a wrong password looks exactly like no payload. The details say "
+                f"whether the legacy format was tried.\n\nDetails: {exc}")
     if isinstance(exc, payload.PayloadError):
         return ("Damaged payload",
                 "A payload header was found but the data behind it is damaged (CRC "
@@ -746,6 +904,34 @@ class ToolTab(ttk.Frame):
         self.app.run_in_background(func, done, failed, status=status)
         return True
 
+    def _is_stale(self, var: tk.StringVar, path: str) -> bool:
+        """Check, when a job finishes, whether its input is still the chosen one.
+
+        A job keeps running when File > Open, Browse..., typing in the entry
+        or Reset All changes the tab's input, and its result belongs to the
+        old file. The done and error callbacks call this first and drop the
+        outcome when it returns True, so a result is never shown (or saved)
+        under another file's name.
+
+        Args:
+            var: The input variable the job read its path from.
+            path: The (stripped) path the job was started with.
+
+        Returns:
+            True if ``var`` no longer holds ``path``. Then the tab's
+            _discard_stale() has run and the status bar says so.
+        """
+        if var.get().strip() == path:
+            return False
+        self._discard_stale()
+        self.app.set_status(f"{self.title}: discarded the result for "
+                            f"{os.path.basename(path) or 'the previous file'}, because "
+                            "another file was chosen while it was computed")
+        return True
+
+    def _discard_stale(self):
+        """Hook: tidy up after a stale result was dropped (see _is_stale)."""
+
     def _path_row(self, parent, row: int, label: str, var: tk.StringVar,
                   browse: Callable[[], None], apply: Callable[[], None] | None = None) -> ttk.Entry:
         """Add "label [entry] Browse..." on one grid row of ``parent``.
@@ -782,8 +968,12 @@ class ToolTab(ttk.Frame):
         """File dialog filters for File > Open in this tab."""
         return filetypes_for(image_extensions(), "Images")
 
-    def open_path(self, path: str):
-        """Load ``path`` as this tab's main input (File > Open)."""
+    def open_path(self, path: str) -> bool | None:
+        """Load ``path`` as this tab's main input (File > Open).
+
+        Returns:
+            False if the tab refused the file (it is busy); otherwise None.
+        """
         raise NotImplementedError
 
     def reset(self):
@@ -1118,7 +1308,8 @@ class EncodeTab(ToolTab):
     def fill_max(self):
         """Fill the message box with Lorem ipsum that uses the whole capacity.
 
-        The filler is ASCII, so characters equal bytes. The fill size is the
+        The filler is ASCII in lines of at most FILLER_LINE_WIDTH
+        characters, so characters equal bytes. The fill size is the
         room at the selected bits per sample, minus the encryption overhead
         when a password is set; with compression on, the text then compresses
         to a fraction of that.
@@ -1134,8 +1325,10 @@ class EncodeTab(ToolTab):
             room -= stego.ENCRYPTION_OVERHEAD
         room = max(0, room)
         # Repeat the filler enough times to cover room (one extra copy handles
-        # the remainder), then cut to exactly room characters.
-        self.set_message((LOREM_IPSUM * (room // len(LOREM_IPSUM) + 1))[:room])
+        # the remainder), then cut to exactly room characters. FILLER_BLOCK
+        # is broken into short lines: one multi-megabyte line would make the
+        # text box re-lay it out on every keystroke.
+        self.set_message((FILLER_BLOCK * (room // len(FILLER_BLOCK) + 1))[:room])
         self.app.set_status(f"Filled {room:,} bytes: 100% of the cover's capacity "
                             f"at {self.bits_var.get()} bit(s) per sample")
 
@@ -1166,6 +1359,11 @@ class EncodeTab(ToolTab):
             return out
 
         def done(path):
+            if self.cover_var.get().strip() != cover:
+                # Another cover was chosen meanwhile; do not replace it.
+                self.app.set_status(f"Resized copy saved as {os.path.basename(path)}; not used, "
+                                    "because the cover was changed meanwhile.")
+                return
             self.set_cover(path)
             self.app.set_status(f"Resized to {os.path.basename(path)}; it is now the cover.")
 
@@ -1212,6 +1410,18 @@ class EncodeTab(ToolTab):
             if not output_path:
                 return False
         output_path = os.fspath(output_path)
+        if same_file(cover, output_path):
+            # The native save dialog only asks "Replace?". Overwriting the
+            # cover would destroy the original, and the change mask would
+            # then compare the stego file with itself ("0 pixels changed").
+            self.result_label.configure(text="Not saved: the output would replace the cover.",
+                                        style="Error.TLabel")
+            self.app.set_status("Hiding cancelled: the output file is the cover")
+            self.app.show_error("Choose another file",
+                                "The stego file would replace the cover, destroying the original "
+                                "image. Save it under a different name.\n\n"
+                                f"Cover: {cover}")
+            return False
         password = self.password_var.get() or None
         compress = self.compress_var.get()
         bits = self.bits_var.get()
@@ -1233,8 +1443,27 @@ class EncodeTab(ToolTab):
                                               Image.Resampling.NEAREST)
             return result
 
-        return self.start_job(work, self._hidden, self._hide_failed,
-                              status=f"Hiding in {os.path.basename(cover)}…")
+        def done(result):
+            if self.cover_var.get().strip() == cover:
+                self._hidden(result)
+                return
+            # The cover was changed (or Reset All) while hiding. The file is
+            # written, so say so, but do not show it under the new cover.
+            out = result["summary"]["output"]
+            self.app.set_status(f"Saved {os.path.basename(out)}; not shown, because the cover "
+                                "was changed meanwhile")
+            self.app.show_info("Saved", f"Stego file saved as\n{out}\n\nThe cover was changed "
+                                        "while hiding, so the result is not shown.")
+
+        def failed(exc):
+            if self.cover_var.get().strip() == cover:
+                self._hide_failed(exc)
+                return
+            title, message = describe_error(exc)
+            self.app.set_status(f"Hiding in {os.path.basename(cover)} failed: {title}")
+            self.app.show_error(title, message)
+
+        return self.start_job(work, done, failed, status=f"Hiding in {os.path.basename(cover)}…")
 
     def _hidden(self, result: dict[str, Any]):
         """Show the outcome of hide() and hand the files to Decode/Compare."""
@@ -1288,6 +1517,8 @@ class DecodeTab(ToolTab):
     State:
         found: The recovered payload.Payload, or None.
         found_format: "stga" or "legacy", or None.
+        found_path: The file ``found`` came from, or None. Saved payloads
+            are named after it, not after whatever the entry holds now.
     """
 
     title = "Decode"
@@ -1300,6 +1531,7 @@ class DecodeTab(ToolTab):
         self.bits_var = tk.StringVar(value="Auto")
         self.found: payload.Payload | None = None
         self.found_format: str | None = None
+        self.found_path: str | None = None
         self._build()
 
     def _build(self):
@@ -1367,6 +1599,7 @@ class DecodeTab(ToolTab):
     def _clear_result(self, headline: str):
         self.found = None
         self.found_format = None
+        self.found_path = None
         self.headline.configure(text=headline, style="Title.TLabel")
         self.detail.configure(text="")
         _set_readonly_text(self.output_text, "")
@@ -1394,14 +1627,35 @@ class DecodeTab(ToolTab):
         password = self.password_var.get() or None
         bits = {"Auto": None, "1": 1, "2": 2}[self.bits_var.get()]
         self._clear_result("Decoding…")
-        return self.start_job(lambda: decode_file(path, password, bits), self._decoded,
-                              self._decode_failed, status=f"Decoding {os.path.basename(path)}…")
 
-    def _decoded(self, result: dict[str, Any]):
-        """Show a recovered payload: text inline, files and binary as hex."""
+        def done(result):
+            if not self._is_stale(self.path_var, path):
+                self._decoded(result, path)
+
+        def failed(exc):
+            if not self._is_stale(self.path_var, path):
+                self._decode_failed(exc)
+
+        return self.start_job(lambda: decode_file(path, password, bits), done, failed,
+                              status=f"Decoding {os.path.basename(path)}…")
+
+    def _discard_stale(self):
+        """A decode finished for a file that is no longer chosen: show nothing."""
+        self._clear_result("Press Decode to look for a hidden payload." if self.path_var.get()
+                           else "Choose a stego file and press Decode.")
+        self.preview.clear()
+
+    def _decoded(self, result: dict[str, Any], path: str | None = None):
+        """Show a recovered payload: text inline, files and binary as hex.
+
+        Args:
+            result: decode_file()'s dict.
+            path: The file it came from; defaults to the entry.
+        """
         found: payload.Payload = result["payload"]
         self.found = found
         self.found_format = result["format"]
+        self.found_path = path or self.path_var.get().strip()
         if result["preview"] is not None:
             self.preview.set_pil_image(result["preview"])
         else:
@@ -1409,7 +1663,11 @@ class DecodeTab(ToolTab):
 
         if result["format"] == "legacy":
             details = ("Legacy format: text followed by 64 zero bits, read at byte boundaries. "
-                       "It has no integrity check, so on flat dark images it can be a false hit.")
+                       "It has no header or checksum; these bytes were accepted because they "
+                       "read as text (a heuristic check), which a stray hit can still pass.")
+            if result.get("legacy_encoding") == "latin-1":
+                details += (f" Stored as {result['legacy_bytes']:,} single-byte Latin-1 "
+                            "characters; shown and saved as UTF-8.")
         else:
             h = result["header"] or {}
             parts = ["STGA frame", f"{h.get('bits_per_sample', '?')} bit(s) per sample",
@@ -1438,7 +1696,7 @@ class DecodeTab(ToolTab):
         _set_readonly_text(self.output_text, body)
         self.save_button.state(["!disabled"])
         self.copy_button.state(["!disabled"] if text is not None else ["disabled"])
-        self.app.set_status(f"{headline} found in {os.path.basename(self.path_var.get())}")
+        self.app.set_status(f"{headline} found in {os.path.basename(self.found_path)}")
 
     def _decode_failed(self, exc: BaseException):
         title, message = describe_error(exc)
@@ -1462,7 +1720,8 @@ class DecodeTab(ToolTab):
 
         A hidden file keeps its stored (sanitized) name; text becomes
         ``<stego name>_payload.txt`` and other data ``.bin`` (see
-        stego.save_payload).
+        stego.save_payload), where the stego name is that of the file the
+        payload was decoded from (found_path).
 
         Args:
             out_dir: Folder to save into. If None, a folder dialog asks.
@@ -1478,8 +1737,9 @@ class DecodeTab(ToolTab):
             if not out_dir:
                 return None
         try:
+            source = self.found_path or self.path_var.get()
             path = stego.save_payload(self.found, out_dir,
-                                      default_stem=f"{safe_stem(self.path_var.get())}_payload")
+                                      default_stem=f"{safe_stem(source)}_payload")
         except OSError as exc:
             self.app.show_exception(exc)
             return None
@@ -1609,24 +1869,39 @@ class AnalyzeTab(ToolTab):
             True if the job started (False if one is already running or no
             image is chosen).
         """
+        # Check busy before touching the input, so a refused run does not
+        # show the new path over the running job's file.
+        if self.busy:
+            self.app.set_status("Analyze: still working, please wait...")
+            return False
         if path is not None:
             self.set_path(path)
         path = self.path_var.get().strip()
         if not path:
             self.app.show_warning("No image", "Choose an image to analyze.")
             return False
-        if self.busy:
-            self.app.set_status("Analyze: still working, please wait...")
-            return False
         password = self.password_var.get() or None
         run_bf = self.bruteforce_var.get()
         self._clear()
         self.banner.configure(text=f"Analyzing {os.path.basename(path)}…")
+
+        def done(result):
+            if not self._is_stale(self.path_var, path):
+                self._analyzed(result)
+
+        def failed(exc):
+            if not self._is_stale(self.path_var, path):
+                self._analyze_failed(exc)
+
         return self.start_job(
             lambda: report.analyze_image(path, run_bruteforce=run_bf, password=password),
-            self._analyzed, self._analyze_failed,
+            done, failed,
             status=f"Analyzing {os.path.basename(path)} (detectors"
                    + (", brute force" if run_bf else "") + ")…")
+
+    def _discard_stale(self):
+        """An analysis finished for a file that is no longer chosen: show nothing."""
+        self._clear()  # also disables Export, which finish() re-enabled
 
     def _analyzed(self, result: dict[str, Any]):
         """Fill the banner, the detector table and the summary."""
@@ -1762,8 +2037,10 @@ class BitplanesTab(ToolTab):
         self.views.add(self.view_amplified, text="LSB amplified")
         self.views.add(self.view_grid, text="All planes")
 
-    def open_path(self, path: str):
-        self.load(path)
+    def open_path(self, path: str) -> bool | None:
+        # Loading starts the job at once, so a busy tab refuses the file
+        # (load() then leaves the input alone and says "still working").
+        return None if self.load(path) else False
 
     def select_file(self):
         """Ask for an image to slice."""
@@ -1782,6 +2059,11 @@ class BitplanesTab(ToolTab):
         Returns:
             True if the background job started.
         """
+        # Check busy before touching the input, so a refused load does not
+        # show the new path over the planes of the file being sliced.
+        if self.busy:
+            self.app.set_status("Bitplanes: still working, please wait...")
+            return False
         if path is not None:
             self.path_var.set(os.fspath(path))
         path = self.path_var.get().strip()
@@ -1800,7 +2082,27 @@ class BitplanesTab(ToolTab):
             grid = bitplanes.save_bitplane_grid(arr, grid_out, channels="RGBA" if has_alpha else "RGB")
             return {"array": arr, "amplified": amplified, "grid": grid, "grid_image": load_preview(grid)}
 
-        return self.start_job(work, self._loaded, status=f"Slicing {os.path.basename(path)}…")
+        def done(result):
+            if not self._is_stale(self.path_var, path):
+                self._loaded(result)
+
+        def failed(exc):
+            if not self._is_stale(self.path_var, path):
+                self.app.show_exception(exc)
+
+        return self.start_job(work, done, failed, status=f"Slicing {os.path.basename(path)}…")
+
+    def _discard_stale(self):
+        """Slicing finished for a file that is no longer chosen: show no planes."""
+        self._clear_views()
+
+    def _clear_views(self):
+        """Forget the loaded image and empty the three views."""
+        self.array = None
+        self.grid_path = None
+        self.plane_info.configure(text="")
+        for view in (self.view_plane, self.view_amplified, self.view_grid):
+            view.clear()
 
     def _loaded(self, result: dict[str, Any]):
         self.array = result["array"]
@@ -1834,11 +2136,7 @@ class BitplanesTab(ToolTab):
 
     def reset(self):
         self.path_var.set("")
-        self.array = None
-        self.grid_path = None
-        self.plane_info.configure(text="")
-        for view in (self.view_plane, self.view_amplified, self.view_grid):
-            view.clear()
+        self._clear_views()
 
 
 class BruteforceTab(ToolTab):
@@ -1958,6 +2256,11 @@ class BruteforceTab(ToolTab):
         Returns:
             True if the job started.
         """
+        # Check busy before touching the input, so a refused run does not
+        # clear the table and show the new path over the running search.
+        if self.busy:
+            self.app.set_status("Brute force: still working, please wait...")
+            return False
         if path is not None:
             self.set_path(path)
         path = self.path_var.get().strip()
@@ -1972,14 +2275,24 @@ class BruteforceTab(ToolTab):
             return False
 
         def done(found):
+            if self._is_stale(self.path_var, path):
+                return
             self._show_candidates(found)
             best = found[0] if found else None
             self.app.set_status(
                 f"Brute force: {len(found)} candidates; best: {best['label']} ({best['kind']}, "
                 f"score {best['score']:.2f})" if best else "Brute force: no candidates")
 
-        return self.start_job(lambda: bruteforce.bruteforce(path, top_k=top_k, max_bit=max_bit), done,
-                              status=f"Brute-forcing {os.path.basename(path)}…")
+        def failed(exc):
+            if not self._is_stale(self.path_var, path):
+                self.app.show_exception(exc)
+
+        return self.start_job(lambda: bruteforce.bruteforce(path, top_k=top_k, max_bit=max_bit),
+                              done, failed, status=f"Brute-forcing {os.path.basename(path)}…")
+
+    def _discard_stale(self):
+        """A search finished for a file that is no longer chosen: list nothing."""
+        self._show_candidates([])
 
     def run_wordlist(self, wordlist: str | os.PathLike | None = None) -> bool:
         """Try each line of a password list as a scatter key (dictionary_attack).
@@ -1990,6 +2303,9 @@ class BruteforceTab(ToolTab):
         Returns:
             True if the job started.
         """
+        if self.busy:
+            self.app.set_status("Brute force: still working, please wait...")
+            return False
         if wordlist is not None:
             self.wordlist_var.set(os.fspath(wordlist))
         path = self.path_var.get().strip()
@@ -2002,7 +2318,13 @@ class BruteforceTab(ToolTab):
             with open(wordlist, encoding="utf-8", errors="replace") as fh:
                 return bruteforce.dictionary_attack(path, fh.read().splitlines())
 
+        def failed(exc):
+            if not self._is_stale(self.path_var, path):
+                self.app.show_exception(exc)
+
         def done(hits):
+            if self._is_stale(self.path_var, path):
+                return
             for hit in hits:
                 hit.setdefault("label", f"password {hit['password']!r}, "
                                         f"{hit['bits_per_sample']} bit(s)/sample")
@@ -2015,7 +2337,7 @@ class BruteforceTab(ToolTab):
                 self.app.set_status("Password list: no password matched")
                 self.app.show_info("No match", "No password in the list unlocked a payload.")
 
-        return self.start_job(work, done, status="Trying passwords…")
+        return self.start_job(work, done, failed, status="Trying passwords…")
 
     def selected(self) -> dict[str, Any] | None:
         """The selected candidate, or None."""
@@ -2148,6 +2470,9 @@ class CompareTab(ToolTab):
         Returns:
             True if the job started.
         """
+        if self.busy:
+            self.app.set_status("Compare: still working, please wait...")
+            return False
         if cover is not None or stego_path is not None:
             self.set_paths(cover or self.cover_var.get(), stego_path or self.stego_var.get())
         cover, stego_file = self.cover_var.get().strip(), self.stego_var.get().strip()
@@ -2178,7 +2503,19 @@ class CompareTab(ToolTab):
                                               Image.Resampling.NEAREST)
             return result
 
-        return self.start_job(work, self._compared, status="Comparing…")
+        def stale() -> bool:
+            return (self._is_stale(self.cover_var, cover)
+                    or self._is_stale(self.stego_var, stego_file))
+
+        def done(result):
+            if not stale():
+                self._compared(result)
+
+        def failed(exc):
+            if not stale():
+                self.app.show_exception(exc)
+
+        return self.start_job(work, done, failed, status="Comparing…")
 
     def _compared(self, result: dict[str, Any]):
         self.figure_path = result["figure"]
@@ -2518,7 +2855,8 @@ class SteganoApp:
             path = self.ask_open_path(f"Open in {tab.title}", tab.open_filetypes())
             if not path:
                 return
-        tab.open_path(os.fspath(path))
+        if tab.open_path(os.fspath(path)) is False:
+            return  # refused while busy; the tab's "still working" status stays
         self.set_status(f"Opened {os.path.basename(os.fspath(path))} in {tab.title}")
 
     def resize_image(self):
