@@ -1,0 +1,8 @@
+# Third-party packages imported by this project.
+# Tested with numpy 2.5.4, Pillow 12.3.0 and matplotlib 3.11.2 on Python 3.13.7 (macOS).
+# tkinter (used only by gui.py) is part of the Python standard library and is not
+# installed with pip; see "Installation" in README.md.
+numpy
+# gui.py uses Image.Resampling, which first appeared in Pillow 9.1.
+pillow>=9.1
+matplotlib
