@@ -10,8 +10,10 @@ build/
 dist/
 *.egg-info/
 
-# Local scratch space and editor/agent folders
+# Local scratch space (including the README quick-start folder) and
+# editor/agent folders
 .scratch/
+/demo/
 .claude/
 .DS_Store
 
