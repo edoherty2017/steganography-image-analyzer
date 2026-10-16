@@ -10,6 +10,18 @@ Covers the bugs of the original implementation that the rewrite fixes:
   back garbled;
 * errors were printed and swallowed instead of raised.
 
+And the regressions found in review of the rewrite's legacy reader:
+
+* a clean cover with a flat region (or a password-scattered frame read with
+  the wrong password) "decoded" to the LSB noise in front of the flat
+  region, because any 64 zero bits look like the delimiter. Those tests use
+  a cover with a flat patch: the noisy synthetic covers alone never contain
+  64 zero LSBs in a row, so they cannot show the bug;
+* a delimiter off a byte boundary (the original make_all.py cut its payload
+  at the bit level) was not found at all;
+* one multi-byte character cut off at the end turned a whole UTF-8 message
+  into Latin-1 mojibake.
+
 Legacy-format images (message bytes + 64 zero bits, as written by the
 original encoder and by make_all.py) are built inline with the original
 algorithm, and the tracked images in results/ are checked against a
@@ -20,6 +32,9 @@ Run from the repository root:
 
     python -m pytest -q tests/test_legacy.py
 """
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -383,3 +398,220 @@ def test_tracked_period_image_shows_original_bug():
     expected = TRACKED_LEGACY[path.name]
     assert original_bitwise_decode(path) == expected[:-1]   # "." lost
     assert decoder.decode(path) == expected
+
+
+# --- clean covers with a flat region (review regression) ---------------------------
+
+def flat_patch_rgb(synthetic_rgb, seed: int = 0, size: int = 256) -> np.ndarray:
+    """A natural-looking cover with one flat 64x64 patch of value 128.
+
+    The flat patch puts thousands of zero LSBs in a row into the stream,
+    which is the delimiter of the legacy format. Real photos have such
+    regions (sky, black borders, uniform blocks); the noisy synthetic
+    covers alone do not.
+    """
+    arr = synthetic_rgb(seed, size=size)
+    arr[100:164, 100:164] = 128
+    return arr
+
+
+@pytest.fixture
+def patch_cover(tmp_path, synthetic_rgb):
+    path = tmp_path / "patch.png"
+    Image.fromarray(flat_patch_rgb(synthetic_rgb)).save(path)
+    return path
+
+
+def test_flat_patch_cover_holds_a_fake_delimiter(patch_cover):
+    """Guard for the tests below: the patch really does fool a bare search."""
+    noise = reference_decode_byte_aligned(patch_cover)
+    assert noise is not None and len(noise) > 1000
+
+
+def test_clean_cover_with_flat_patch_finds_nothing(patch_cover):
+    assert decoder.decode(patch_cover) is None
+    assert decoder.decode_legacy(patch_cover) is None
+    assert decoder.find_legacy_message(
+        np.asarray(Image.open(patch_cover).convert("RGB"))) is None
+
+
+def test_raw_reading_keeps_its_contract_but_is_not_a_message(patch_cover, tmp_path,
+                                                             synthetic_rgb):
+    """legacy_text_from_pixels() is the unchecked reading main.py scores itself."""
+    rgb = np.asarray(Image.open(patch_cover).convert("RGB"))
+    assert decoder.legacy_text_from_pixels(rgb) == reference_decode_byte_aligned(patch_cover)
+    assert decoder.find_legacy_message(rgb) is None
+    legacy = write_legacy_image(tmp_path, synthetic_rgb, b"plain text")
+    rgb = np.asarray(Image.open(legacy).convert("RGB"))
+    assert decoder.legacy_text_from_pixels(rgb) == "plain text"
+    assert decoder.find_legacy_message(rgb).text == "plain text"
+
+
+def test_scattered_frame_with_wrong_password_finds_nothing(tmp_path, patch_cover):
+    out = tmp_path / "s.png"
+    stego.hide(patch_cover, out, "real secret", password="pw")
+    with pytest.raises(stego.NoPayloadError):
+        stego.reveal(out, password="wrong")
+    # Before the fix the legacy fallback returned ~9,600 chars of LSB noise.
+    assert decoder.decode(out, password="wrong") is None
+    assert decoder.decode(out) is None
+    assert decoder.decode(out, password="pw") == "real secret"
+
+
+def test_cli_wrong_password_on_flat_patch_cover_fails(tmp_path, patch_cover):
+    """The headline symptom: main.py printed noise as a message and exited 0."""
+    out = tmp_path / "s.png"
+    stego.hide(patch_cover, out, "real secret", password="pw")
+    env = dict(os.environ, MPLBACKEND="Agg", PYTHONIOENCODING="utf-8")
+    for extra in (["--password", "wrong"], []):
+        proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "main.py"), "decode", "-i", str(out), *extra],
+            cwd=tmp_path, capture_output=True, text=True, encoding="utf-8",
+            env=env, timeout=180, stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        assert proc.returncode == 1, (proc.stdout, proc.stderr)
+        assert "Decoded Message Found" not in proc.stdout
+        assert "Traceback" not in proc.stderr
+
+
+def test_smooth_blue_reference_image_is_not_a_message():
+    """The repo's clean reference image (gitignored, so optional)."""
+    path = REPO_ROOT / "test-images" / "smoothBlue.png"
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    assert decoder.decode(path) is None
+
+
+@pytest.mark.parametrize("prefix", [
+    b"6\x00(4\x88#s\n",          # NUL and C1 bytes, as in the reported noise
+    b"\xff\xff\xff\xff\xff\xff",  # a flat white region: "ÿÿÿÿÿÿ" in Latin-1
+    b"\xb6\xdbm\xb6\xdbm",        # a flat (odd, even, odd) colour
+    b"\xc3(\x80\xa9\x92\x41",     # invalid UTF-8, mostly non-ASCII
+])
+def test_noise_before_the_delimiter_is_not_text(tmp_path, synthetic_rgb, prefix):
+    path = write_legacy_image(tmp_path, synthetic_rgb, prefix)
+    assert reference_decode_byte_aligned(path) is not None  # a bare search "finds" it
+    assert decoder.decode(path) is None
+
+
+# --- delimiter off a byte boundary (review regression) -------------------------------
+
+def make_all_bit_cut_image(rgb: np.ndarray, text: str) -> np.ndarray:
+    """The original make_all.py case C: payload cut at the BIT level.
+
+    ``bits = to_bits_utf8(text)[:3*W*H - 64]`` then 64 zero bits, filling the
+    whole capacity. When ``W*H % 8 != 0`` the delimiter starts mid-byte.
+    """
+    out = np.array(rgb, dtype=np.uint8, copy=True)
+    flat = out.reshape(-1)
+    cap = flat.size - 64
+    bits = np.unpackbits(np.frombuffer(text.encode("utf-8"), dtype=np.uint8))[:cap]
+    bits = np.concatenate([bits, np.zeros(64, dtype=np.uint8)])
+    flat[: bits.size] = (flat[: bits.size] & 0xFE) | bits
+    return out
+
+
+@pytest.mark.parametrize("width,height", [(101, 99), (33, 33), (101, 101)])
+def test_unaligned_delimiter_from_original_make_all(tmp_path, width, height):
+    assert (width * height) % 8 != 0
+    rng = np.random.default_rng(width)
+    cover = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
+    text = "I am a very sneaky dinosaur... Nobody knows I am here. " * 400
+    path = tmp_path / "bitcut.png"
+    Image.fromarray(make_all_bit_cut_image(cover, text)).save(path)
+
+    assert reference_decode_byte_aligned(path) is None   # no aligned delimiter
+    expected = original_bitwise_decode(path)
+    assert expected and text.startswith(expected)
+    assert decoder.decode(path) == expected
+    assert decoder.decode_legacy(path) == expected
+
+    found = decoder.find_legacy_message(np.asarray(Image.open(path).convert("RGB")))
+    assert found is not None and not found.byte_aligned
+    # The zero run starts where make_all.py wrote the delimiter, or a few bits
+    # earlier when the cut-off last bits of the text are zeros themselves.
+    written_at = 3 * width * height - 64
+    assert written_at - 8 < found.delimiter_bit <= written_at
+    assert found.delimiter_bit % 8 != 0
+    assert found.raw == expected.encode("ascii")
+
+
+def test_unaligned_delimiter_wins_over_a_later_aligned_zero_run(tmp_path, synthetic_rgb):
+    """A flat region after the message gives an aligned match full of NULs."""
+    rgb = synthetic_rgb(2, size=64)
+    rgb[32:] = 128   # flat bottom half: aligned zero bytes after the message
+    message = "unaligned end, then a flat area"
+    bits = np.unpackbits(np.frombuffer(message.encode(), dtype=np.uint8))
+    bits = np.concatenate([bits, [1, 0, 1], np.zeros(64, dtype=np.uint8)])  # 3 stray bits
+    flat = rgb.reshape(-1)
+    flat[: bits.size] = (flat[: bits.size] & 0xFE) | bits
+    path = tmp_path / "late_flat.png"
+    Image.fromarray(rgb).save(path)
+    assert decoder.decode(path) == message
+
+
+def test_aligned_delimiter_still_keeps_trailing_zero_bit_character(tmp_path, synthetic_rgb):
+    """The bit-offset fallback must not undo the "abcd" fix."""
+    path = write_legacy_image(tmp_path, synthetic_rgb, b"abcd")
+    found = decoder.find_legacy_message(np.asarray(Image.open(path).convert("RGB")))
+    assert found.text == "abcd" and found.byte_aligned and found.delimiter_bit == 32
+
+
+def test_original_encoder_wide_code_point_gives_none_not_noise(tmp_path, synthetic_rgb):
+    """Documented limit: format(ord('€'), '08b') is 14 bits wide.
+
+    Every byte after it is shifted, so the bytes before the delimiter are
+    not text. The original decoder printed 'price 5\\x82°\\x81½'; the new
+    one reports nothing rather than noise.
+    """
+    message = "price 5€ ok"
+    bits = "".join(format(ord(c), "08b") for c in message) + "0" * 64
+    rgb = synthetic_rgb(3, size=64)
+    flat = rgb.reshape(-1)
+    arr = np.frombuffer(bits.encode("ascii"), dtype=np.uint8) - ord("0")
+    flat[: arr.size] = (flat[: arr.size] & 0xFE) | arr
+    path = tmp_path / "euro.png"
+    Image.fromarray(rgb).save(path)
+    assert original_bitwise_decode(path).startswith("price 5\x82")
+    assert decoder.decode(path) is None
+
+
+# --- a multi-byte character cut off at the end (review regression) -------------------
+
+def test_cut_utf8_character_does_not_turn_message_into_mojibake(tmp_path, synthetic_rgb):
+    # As in the review repro: the message was cut at capacity inside an "é".
+    data = ("café " * 200).encode("utf-8") + b"caf\xc3"
+    path = write_legacy_image(tmp_path, synthetic_rgb, data)
+    decoded = decoder.decode(path)
+    assert decoded == "café " * 200 + "caf"
+    assert "Ã" not in decoded
+    found = decoder.find_legacy_message(np.asarray(Image.open(path).convert("RGB")))
+    assert found.encoding == "utf-8" and found.raw == data
+
+
+def test_cut_utf8_character_at_end_of_long_make_all_payload(tmp_path, synthetic_rgb):
+    """Bit-level cut on a 64x64 cover (aligned) that lands inside 'é'."""
+    rgb = synthetic_rgb(4, size=64)
+    text = "café " * 50000
+    path = tmp_path / "cafe_cut.png"
+    Image.fromarray(make_all_bit_cut_image(rgb, text)).save(path)
+    decoded = decoder.decode(path)
+    assert decoded is not None and decoded.startswith("café café café")
+    assert "Ã" not in decoded
+    assert text.startswith(decoded)
+
+
+@pytest.mark.parametrize("cut", [b"\xe2\x82", b"\xf0\x9f\x98"])
+def test_cut_multi_byte_tail_after_ascii_is_dropped(tmp_path, synthetic_rgb, cut):
+    # Two or three bytes of a cut character cannot be Latin-1 text.
+    path = write_legacy_image(tmp_path, synthetic_rgb, b"price 5 " + cut)
+    assert decoder.decode(path) == "price 5 "
+
+
+def test_single_high_byte_after_ascii_reads_as_latin1(tmp_path, synthetic_rgb):
+    # The original encoder wrote 'café' as b'caf\xe9'. A cut UTF-8 'é' would
+    # also end in one high byte after ASCII; Latin-1 is the better guess.
+    path = write_legacy_image(tmp_path, synthetic_rgb, "café".encode("latin-1"))
+    assert decoder.decode(path) == "café"
+    found = decoder.find_legacy_message(np.asarray(Image.open(path).convert("RGB")))
+    assert found.encoding == "latin-1"

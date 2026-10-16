@@ -623,9 +623,62 @@ def _make_figures(result: dict[str, Any], out: Path, stem: str) -> list[dict[str
 # ---------------------------------------------------------------------------
 
 def _md_cell(value: Any) -> str:
-    """Make a value safe for one Markdown table cell."""
+    """Make untrusted text inert in Markdown prose or one table cell.
+
+    Text from the LSB stream (brute-force and signature previews, and the
+    overall summary built from them) is attacker-controlled, so it must
+    render as literal characters and never as markup:
+
+    * newlines are flattened so the value stays on one line (one cell);
+    * ``&``, ``<`` and ``>`` become HTML entities, so ``<script>`` or
+      ``<img onerror=...>`` is not passed through as raw HTML. Entities are
+      used rather than ``\\<`` because not every Markdown dialect treats
+      ``<`` as backslash-escapable (Python-Markdown does not);
+    * backslash, pipe, backtick and square brackets are backslash-escaped,
+      so the value cannot split a table cell, open a code span, or form a
+      link or image such as ``[x](javascript:...)``.
+
+    Not for use inside a code span, where entities and backslash escapes
+    are shown literally; use ``_md_code`` there.
+
+    Args:
+        value: Anything; it is converted with ``str()``.
+
+    Returns:
+        The escaped single-line text.
+    """
     text = str(value).replace("\r", " ").replace("\n", " ")
-    return text.replace("\\", "\\\\").replace("|", "\\|").replace("`", "\\`")
+    text = html.escape(text, quote=False)
+    for ch in "\\|`[]":
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _md_code(value: Any, *, in_table: bool = False) -> str:
+    """Render untrusted text as one inline Markdown code span.
+
+    Code-span content is literal (no HTML, no entities, no backslash
+    escapes), so the only risks are a backtick closing the span early and,
+    inside a table, a pipe ending the cell. The delimiter is one backtick
+    longer than the longest backtick run in the text (CommonMark code spans
+    close only on a run of the same length), padded with spaces when the
+    text starts or ends with a backtick.
+
+    Args:
+        value: Anything; it is converted with ``str()``.
+        in_table: True when the span sits in a GFM table cell, where a pipe
+            must be written as ``\\|`` even inside a code span.
+
+    Returns:
+        The complete code span, delimiters included.
+    """
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    if in_table:
+        text = text.replace("|", "\\|")
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    tick = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{tick}{pad}{text}{pad}{tick}"
 
 
 def _md_fence(text: str) -> str:
@@ -649,7 +702,7 @@ def _payload_md(p: dict | None) -> list[str]:
     if p.get("decoded"):
         lines.append(f"- **Size:** {p['data_bytes']:,} bytes")
         if p.get("filename"):
-            lines.append(f"- **Stored file name:** `{_md_cell(p['filename'])}`")
+            lines.append(f"- **Stored file name:** {_md_code(p['filename'])}")
         kind = "Text" if p.get("is_text") else "First bytes (hex)"
         more = " (truncated)" if p.get("preview_truncated") else ""
         fence = _md_fence(p["preview"])
@@ -675,7 +728,7 @@ def _to_markdown(result: dict[str, Any], figs: list[dict[str, str]]) -> str:
         "",
         "| Property | Value |",
         "|---|---|",
-        f"| File | `{_md_cell(result['image'])}` ({result['file_bytes']:,} bytes) |",
+        f"| File | {_md_code(result['image'], in_table=True)} ({result['file_bytes']:,} bytes) |",
         f"| Format / mode | {result['format']} / {result['mode']} |",
         f"| Size | {size['width']} x {size['height']} px |",
         f"| LSB capacity | {result['capacity_bytes']:,} bytes at 1 bit/sample, "

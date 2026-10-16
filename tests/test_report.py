@@ -7,6 +7,7 @@ already gives a false "suspicious", so the clean-verdict tests use 256).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from html.parser import HTMLParser
@@ -294,6 +295,83 @@ def test_write_markdown_escapes_table_cells(cover, tmp_path):
     table_rows = [line for line in md.splitlines() if line.startswith("| stga")]
     assert table_rows and "alpha\\|beta\\|gamma" in table_rows[0]
     assert table_rows[0].count(" | ") == 4  # still exactly five cells
+
+
+def _split_fences(md: str) -> tuple[str, str]:
+    """Split Markdown into (text outside code fences, text inside them)."""
+    outside, inside, fence = [], [], None
+    for line in md.splitlines():
+        if fence is None and line.startswith("```"):
+            fence = line[: len(line) - len(line.lstrip("`"))]
+        elif fence is not None and line == fence:
+            fence = None
+        else:
+            (inside if fence else outside).append(line)
+    return "\n".join(outside), "\n".join(inside)
+
+
+def test_write_markdown_neutralises_html_and_links(synthetic_rgb, save_png, tmp_path):
+    """Untrusted LSB text never reaches the Markdown report as raw HTML or a link.
+
+    Regression: brute-force previews, signature-scan previews and the
+    summary built from them were written outside code spans with only
+    pipes and backticks escaped, so ``<script>`` or ``<img onerror=...>``
+    became live HTML in renderers that do not sanitize (pandoc, some
+    previewers).
+    """
+    # The link comes first so that it survives the shortest preview truncation.
+    msg = ("[click](javascript:alert(2)) <img src=x onerror=alert(document.domain)> "
+           "<script>alert(1)</script> Meeting notes for the quarterly review, "
+           "see attached plan and budget.")
+    path = save_png(legacy_image(synthetic_rgb(7), msg.encode()), "html_legacy.png")
+    r = report.analyze_image(path)  # brute force on: it feeds the summary and its table
+    assert r["payload"]["format"] == "legacy" and r["payload"]["preview"] == msg
+    md = Path(report.write_report(r, tmp_path / "rep", fmt="md", figures=False)).read_text()
+
+    outside, inside = _split_fences(md)
+    # Every untrusted copy outside the payload fence is inert...
+    for raw in ("<img", "<script", "</script", "[click]("):
+        assert raw not in outside, raw
+    assert not re.search(r"(?<!\\)\]\(", outside)  # no unescaped "](" link target
+    assert "&lt;img src=x onerror=alert(document.domain)&gt;" in outside
+    assert "\\[click\\](javascript" in outside
+    # ...and the tainted sections all still show the text (escaped).
+    sections = {"## Verdict": "## Hidden payload",
+                "## Signature scan": "## Brute-force extraction",
+                "## Brute-force extraction": "## How to read this report"}
+    for start, end in sections.items():
+        body = outside.split(start, 1)[1].split(end, 1)[0]
+        assert "\\[click\\](javascript" in body and "&lt;img src=x" in body, start
+    # The fenced payload preview is literal and stays verbatim.
+    assert msg in inside
+    # Escaping did not break the table shape: the top brute-force row has five cells.
+    row = next(line for line in md.splitlines() if line.startswith("| 1 |"))
+    assert row.count(" | ") == 4
+
+
+def test_md_helpers_escape_untrusted_text():
+    cell = report._md_cell("a & b <i>x</i> | `c` [d](e) \\ f\nnext")
+    assert cell == "a &amp; b &lt;i&gt;x&lt;/i&gt; \\| \\`c\\` \\[d\\](e) \\\\ f next"
+
+    # Code spans hold literal text: no entities, a delimiter longer than any
+    # backtick run inside, and pipes escaped only in a table cell.
+    assert report._md_code("plain.png") == "`plain.png`"
+    assert report._md_code("a<b>&c") == "`a<b>&c`"
+    assert report._md_code("x``y") == "```x``y```"
+    assert report._md_code("`tick") == "`` `tick ``"
+    assert report._md_code("a|b") == "`a|b`"
+    assert report._md_code("a|b\nc", in_table=True) == "`a\\|b c`"
+
+
+def test_write_markdown_stored_file_name_cannot_break_code_span(cover, tmp_path):
+    out = tmp_path / "named.png"
+    name = "x`<img src=y onerror=alert(3)>`.txt"
+    stego.hide(cover, out, b"\x00\x01binary body", filename=name)
+    r = report.analyze_image(out, run_bruteforce=False)
+    assert r["payload"]["filename"] == name
+    md = Path(report.write_report(r, tmp_path / "rep", fmt="md", figures=False)).read_text()
+    line = next(ln for ln in md.splitlines() if ln.startswith("- **Stored file name:**"))
+    assert line == f"- **Stored file name:** ``{name}``"
 
 
 def test_write_html_is_self_contained_and_escaped(cover, tmp_path):

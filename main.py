@@ -13,7 +13,7 @@ Python:
                 sample.
     decode      Recover it (stego.reveal), falling back to the original
                 delimiter format of this project for old images
-                (decoder.decode_legacy).
+                (decoder.decode_legacy) when that reading looks like text.
     capacity    How many bytes a cover can hold.
     analyze     Full steganalysis of one image (report.analyze_image): the
                 statistical detectors (chi-square, sample pair analysis, RS
@@ -23,7 +23,8 @@ Python:
     bitplanes   Bit-plane grid and cover-vs-stego LSB difference mask
                 (bitplanes.py).
     bruteforce  Try ~100 bit layouts and rank what comes out (bruteforce.py),
-                optionally with a password word list for scattered payloads.
+                optionally with a password word list for scattered payloads
+                (the word list also works on WAV files).
     compare     Cover-vs-stego histogram comparison plots
                 (steganalysis.analyze_comparison) plus even/odd pair
                 statistics (pairwise_stats.pair_stats).
@@ -55,11 +56,37 @@ Passwords: ``--password PW`` is visible to other users in the process list
 and is saved in shell history; ``--password-prompt`` asks for it instead
 (twice when encoding). When standard input is not a terminal,
 ``--password-prompt`` reads one line from it, so scripts can pipe the
-password in.
+password in. An empty password is refused either way, so an unset shell
+variable (``--password "$PW"``) cannot silently write an unencrypted,
+unscattered payload.
 
-Exit status: 0 on success, 1 on an error or when nothing hidden is found
-(the message goes to standard error), 2 for invalid arguments (from
-argparse), 130 when interrupted with Ctrl-C.
+Untrusted output: recovered text comes from the stego file, so ``decode``
+replaces control characters (escape sequences, carriage returns, C1
+controls, bidirectional overrides) with U+FFFD before printing, the same
+rule ``analyze`` and ``bruteforce`` use for their previews. ``decode --out``
+writes the exact bytes.
+
+Legacy fallback: the original delimiter format has no header, and any
+image whose LSB stream contains 64 zero bits (a flat black or even-valued
+region is enough) "decodes" to whatever comes before them. So ``decode``
+accepts a legacy reading only when ``bruteforce.score_candidate`` reads it
+as text ending at the delimiter with a heuristic score of at least
+LEGACY_MIN_SCORE, and says on stderr when the score is low. ``--legacy``
+keeps the "is it text" check but drops the score floor.
+
+Carriers: ``encode``, ``decode`` and ``capacity`` work on every registered
+carrier (images and WAV). ``analyze``, ``bitplanes``, ``compare`` and the
+layout part of ``bruteforce`` read images only; for a WAV file
+``bruteforce`` runs only the ``--wordlist`` attack.
+
+Exit status: 0 on success; 1 on an error or when nothing hidden is found
+(the message goes to standard error): ``decode`` with no frame and no
+plausible legacy message, and ``bruteforce --wordlist`` when no password
+matched and no layout scored BRUTEFORCE_FOUND_SCORE or more (without
+``--wordlist`` the brute force only ranks layouts and exits 0); 2 for
+invalid arguments (from argparse or the option checks in
+_check_combinations, e.g. an empty ``--password`` or a ``--channels``
+letter outside RGBA); 130 when interrupted with Ctrl-C.
 
 Heavy modules (NumPy, Pillow, Matplotlib, the detectors) are imported inside
 each subcommand, so ``--help`` and the light subcommands start quickly.
@@ -80,6 +107,33 @@ EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
 PROG = "main.py"
+
+# Lowest heuristic score (bruteforce.score_candidate, a ranking confidence in
+# [0, 1], not a probability) at which decode accepts a legacy delimiter
+# reading when the image holds no STGA frame. bruteforce scores a legacy
+# reading 0.15 to 0.95 when the bytes before the 64 zero bits are printable
+# text: 0.15 for 1 to 3 ASCII characters, more for longer word-like text
+# ("hello" 0.28, "attack at dawn" 0.55, a 40-character sentence 0.8). Text
+# that is repetitive ("UUUU", which smooth gradients produce) gets 0.05, and
+# binary noise is not text at all. 0.15 is bruteforce's own floor for the
+# legacy band, so short legacy messages still decode.
+LEGACY_MIN_SCORE = 0.15
+
+# Below this score a legacy reading is weak evidence, and decode says so on
+# stderr. It is the cut point report.py uses before it reports a legacy
+# message (report._LEGACY_MIN_SCORE), so analyze stays the conservative one.
+LEGACY_CONFIDENT_SCORE = 0.5
+
+# With --wordlist, bruteforce exits 1 when no password matched and no layout
+# candidate scored at least this much (heuristic). bruteforce reads a layout
+# further than --max-bytes from the same score (bruteforce._EXPAND_MIN_SCORE),
+# and on the test covers every layout of a clean image stayed below 0.3.
+BRUTEFORCE_FOUND_SCORE = 0.5
+
+# Format characters kept although str.isprintable() rejects them: the zero
+# width non-joiner and joiner, which emoji sequences and some scripts need and
+# which do nothing in a terminal.
+_SAFE_FORMAT_CHARS = "‌‍"
 
 
 class CLIError(Exception):
@@ -143,10 +197,107 @@ def _write_output(data: bytes, out: str, found: Any = None) -> Path:
     return path
 
 
+def _terminal_safe(text: str, *, one_line: bool = False) -> str:
+    """Make untrusted text safe to print to a terminal.
+
+    Recovered payload text, stored file names and paths built from them come
+    from the stego file, and terminals act on control characters: ESC starts
+    sequences that retitle the window, clear the screen, recolour text or
+    move the cursor to fake earlier output (and, on some terminals, write
+    the clipboard with OSC 52); CR overwrites the current line. Every
+    character ``str.isprintable()`` rejects (C0 and C1 controls, DEL,
+    bidirectional overrides and other format characters, line and paragraph
+    separators) becomes U+FFFD, except newline and tab and the zero-width
+    joiners. CRLF line ends become plain newlines first. This is the rule
+    report._printable applies to analyze's previews.
+
+    Args:
+        text: Untrusted text.
+        one_line: Also replace newlines and tabs (for names and paths that
+            are printed inside a sentence).
+
+    Returns:
+        The text with unsafe characters replaced.
+    """
+    text = text.replace("\r\n", "\n")
+    keep = _SAFE_FORMAT_CHARS if one_line else "\n\t" + _SAFE_FORMAT_CHARS
+    return "".join(ch if ch.isprintable() or ch in keep else "�" for ch in text)
+
+
 def _print_text_message(text: str) -> None:
-    """Print a recovered message in the format the original CLI used."""
+    """Print a recovered message in the format the original CLI used.
+
+    The text is untrusted, so control characters are replaced first
+    (_terminal_safe); a note on stderr says how many, and that ``--out``
+    gives the exact bytes.
+    """
+    safe = _terminal_safe(text)
     print("Decoded Message Found:")
-    print(text)
+    print(safe)
+    replaced = safe.count("�") - text.count("�")
+    if replaced:
+        print(f"note: {_plural(replaced, 'control character')} replaced with U+FFFD for "
+              "display; use --out PATH to save the exact bytes", file=sys.stderr)
+
+
+def _read_legacy(path: str) -> dict[str, Any]:
+    """Read the legacy delimiter format and judge whether it looks like text.
+
+    ``decoder.decode_legacy`` returns the bytes before the first 64 zero
+    bits of the RGB LSB stream, which is *something* for any image with a
+    flat black or even-valued region. So the same bytes, cut exactly at the
+    delimiter, are also scored with ``bruteforce.score_candidate`` under
+    the legacy layout (R, G, B LSBs, row-major, most significant bit
+    first). That is a heuristic text score, not a statistical test.
+
+    Args:
+        path: The image.
+
+    Returns:
+        A dict with ``text`` (decoder.legacy_text_from_pixels: None when the
+        stream has no delimiter, "" when it starts with one), ``raw_bytes``
+        (bytes before the delimiter), ``is_text`` (True when the bytes read
+        as printable text that ends at the delimiter) and ``score`` (the
+        heuristic score of that text, 0.0 when it is not text).
+
+    Raises:
+        PIL.UnidentifiedImageError: If the file is not a readable image.
+    """
+    import numpy as np
+    from PIL import Image
+
+    import bruteforce as bf
+    import decoder
+
+    with Image.open(path) as img:
+        # Same conversion as decoder.decode_legacy (alpha dropped).
+        rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    text = decoder.legacy_text_from_pixels(rgb)
+    result: dict[str, Any] = {"text": text, "raw_bytes": 0, "is_text": False, "score": 0.0}
+    if not text:
+        return result
+
+    delim = decoder.LEGACY_DELIMITER_BYTES
+    # decode_legacy decodes the bytes as UTF-8, or as Latin-1 (one byte per
+    # character) when they are not UTF-8; the UTF-8 length is never the
+    # smaller, so this window holds the message bytes and the delimiter.
+    window = bf.extract_bytes(rgb, bf.Strategy("RGB", 0, "msb", "row"),
+                              len(text.encode("utf-8")) + len(delim))
+    end = window.find(delim)
+    if end <= 0:
+        return result
+    raw = window[:end]
+    cand = bf.score_candidate(raw + delim)
+    fmt = (cand.get("info") or {}).get("format")
+    if fmt is not None:
+        is_text = cand["kind"] == "text" and fmt == "legacy-delimiter"
+    else:
+        # Older scoring without the format field: the text candidate must
+        # cover every byte before the delimiter.
+        is_text = cand["kind"] == "text" and cand.get("data") == raw
+    result.update(raw_bytes=len(raw), is_text=is_text,
+                  score=float(cand["score"]) if is_text else 0.0)
+    return result
 
 
 def _plural(n: int, word: str) -> str:
@@ -200,9 +351,14 @@ def cmd_encode(args: argparse.Namespace) -> int:
 
 
 def cmd_decode(args: argparse.Namespace) -> int:
-    """Recover a hidden payload (stego.reveal, with the legacy fallback)."""
+    """Recover a hidden payload (stego.reveal, with the legacy fallback).
+
+    The legacy reading is accepted only when it reads as text ending at the
+    64 zero bits and, unless ``--legacy`` was given, scores at least
+    LEGACY_MIN_SCORE (see _read_legacy). Otherwise nothing was found and
+    the command fails with exit status 1.
+    """
     import carriers
-    import decoder
     import stego
     from carriers.image_lsb import ImageLSBCarrier
 
@@ -228,32 +384,55 @@ def cmd_decode(args: argparse.Namespace) -> int:
             else:
                 return _emit_payload(found, args.out)
 
-    text = decoder.decode_legacy(args.image)
+    legacy = _read_legacy(args.image)
+    text, score = legacy["text"], legacy["score"]
     if not text:
         if args.legacy:
             raise CLIError("no legacy-format message found (no text followed by "
                            "64 zero bits at the start of the RGB LSB stream)")
         raise CLIError(f"{reason}; the legacy delimiter format was not found either")
+    if not legacy["is_text"]:
+        detail = (f"the {_plural(legacy['raw_bytes'], 'byte')} before the first 64 zero "
+                  "bits of the RGB LSB stream are not text")
+    elif not args.legacy and score < LEGACY_MIN_SCORE:
+        detail = (f"the text before the first 64 zero bits does not look like a message "
+                  f"(heuristic score {score:.2f}; --legacy prints it anyway)")
+    else:
+        detail = None
+    if detail is not None:
+        if args.legacy:
+            raise CLIError(f"no legacy-format message found: {detail}")
+        raise CLIError(f"{reason}; the legacy delimiter format was not found either ({detail})")
+
     if not args.legacy:
         print("note: no STGA frame; read the legacy delimiter format "
-              "(text followed by 64 zero bits)", file=sys.stderr)
+              f"(text followed by 64 zero bits), heuristic text score {score:.2f}",
+              file=sys.stderr)
+    if score < LEGACY_CONFIDENT_SCORE:
+        print("note: a score this low is weak evidence: short or repetitive text before "
+              "a run of zero bits also occurs by chance in clean images", file=sys.stderr)
     if args.out:
-        path = _write_output(text.encode("utf-8"), args.out)
-        print(f"Saved {len(text.encode('utf-8')):,} bytes to '{path}'")
+        data = text.encode("utf-8")
+        path = _write_output(data, args.out)
+        print(f"Saved {len(data):,} bytes to '{_terminal_safe(str(path), one_line=True)}'")
         return EXIT_OK
     _print_text_message(text)
     return EXIT_OK
 
 
 def _emit_payload(found: Any, out: str | None) -> int:
-    """Print or save a payload returned by stego.reveal()."""
+    """Print or save a payload returned by stego.reveal().
+
+    The stored file name and the text are untrusted and are printed through
+    _terminal_safe; the saved file gets the exact bytes.
+    """
     if out:
         path = _write_output(found.data, out, found)
-        print(f"Saved {len(found.data):,} bytes to '{path}'")
+        print(f"Saved {len(found.data):,} bytes to '{_terminal_safe(str(path), one_line=True)}'")
         return EXIT_OK
     if found.filename:
-        print(f"Hidden file found: '{found.filename}' ({len(found.data):,} bytes). "
-              "Use --out DIR to save it.")
+        print(f"Hidden file found: '{_terminal_safe(found.filename, one_line=True)}' "
+              f"({len(found.data):,} bytes). Use --out DIR to save it.")
         return EXIT_OK
     try:
         text = found.data.decode("utf-8")
@@ -329,11 +508,37 @@ def cmd_bitplanes(args: argparse.Namespace) -> int:
 
 
 def cmd_bruteforce(args: argparse.Namespace) -> int:
-    """Rank many bit layouts by how much the extracted data looks like a payload."""
-    import bruteforce as bf
+    """Rank many bit layouts by how much the extracted data looks like a payload.
 
-    results = bf.bruteforce(args.image, top_k=args.top, max_bytes=args.max_bytes,
-                            max_bit=args.max_bit)
+    The layouts are pixel layouts, so they are tried on images only. The
+    ``--wordlist`` attack goes through the carrier registry and also works
+    on WAV files, where it is the only thing run. With ``--wordlist`` the
+    command fails (exit 1) when no password matched and no layout scored
+    BRUTEFORCE_FOUND_SCORE or more; without it, it only ranks and exits 0.
+    """
+    import bruteforce as bf
+    import carriers
+    from carriers.image_lsb import ImageLSBCarrier
+
+    if not os.path.exists(args.image):
+        raise FileNotFoundError(2, "No such file", args.image)
+    try:
+        carrier_cls = carriers.carrier_for_path(args.image)
+    except ValueError:
+        carrier_cls = None  # unknown extension: Pillow may still read it
+    is_image = carrier_cls is None or issubclass(carrier_cls, ImageLSBCarrier)
+    if not is_image and not args.wordlist:
+        raise CLIError(f"the layout brute force reads images only, and {args.image!r} is a "
+                       f"{carrier_cls.name} file; use --wordlist FILE to try passwords "
+                       "against a payload scattered with one, or decode for an unscattered one")
+
+    results: list[dict[str, Any]] = []
+    if is_image:
+        results = bf.bruteforce(args.image, top_k=args.top, max_bytes=args.max_bytes,
+                                max_bit=args.max_bit)
+    else:
+        print(f"note: '{args.image}' is not an image ({carrier_cls.name}); "
+              "only the word list is tried", file=sys.stderr)
     hits = None
     if args.wordlist:
         with open(args.wordlist, encoding="utf-8", errors="replace") as fh:
@@ -348,7 +553,8 @@ def cmd_bruteforce(args: argparse.Namespace) -> int:
                 {k: v for k, v in h.items() if k != "data"} for h in hits]
         print(json.dumps(doc, indent=2, ensure_ascii=False))
     else:
-        print(f"{'score':>5}  {'layout':<26} {'kind':<10} preview")
+        if is_image:
+            print(f"{'score':>5}  {'layout':<26} {'kind':<10} preview")
         for r in results:
             print(f"{r['score']:5.2f}  {r['label']:<26} {r['kind']:<10} {r['preview']}")
         if hits is not None:
@@ -367,6 +573,12 @@ def cmd_bruteforce(args: argparse.Namespace) -> int:
             print(f"warning: the best candidate only scored {best['score']:.2f}; "
                   "it is probably noise", file=sys.stderr)
         print(f"Saved best candidate to '{bf.save_candidate(best, args.save)}'", file=note)
+
+    if hits is not None and not hits and not any(
+            r["score"] >= BRUTEFORCE_FOUND_SCORE for r in results):
+        found_by_layouts = (f", and no layout scored {BRUTEFORCE_FOUND_SCORE:.2f} or more"
+                            if is_image else "")
+        raise CLIError(f"no password in the word list matched{found_by_layouts}")
     return EXIT_OK
 
 
@@ -540,7 +752,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("bruteforce", help="try many bit layouts and rank the results",
                        description="Extract bytes under many bit layouts and rank them by "
                                    "how much they look like a payload (heuristic scores).")
-    p.add_argument("-i", "--image", required=True, help="suspect image")
+    p.add_argument("-i", "--image", required=True,
+                   help="suspect image (or a WAV file, with --wordlist)")
     p.add_argument("--top", type=int, default=10, help="candidates to show (default 10)")
     p.add_argument("--max-bit", type=int, default=1,
                    help="highest bit plane to try, 0-7 (default 1)")
@@ -548,7 +761,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="bytes read per layout before expanding good ones (default 4096)")
     p.add_argument("--save", metavar="DIR", help="save the best candidate's data into DIR")
     p.add_argument("--wordlist", metavar="FILE",
-                   help="also try each line of FILE as the password of a scattered payload")
+                   help="also try each line of FILE as the password of a scattered payload "
+                        "(the only attack run on a WAV file)")
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.set_defaults(func=cmd_bruteforce)
 
@@ -593,6 +807,17 @@ def _check_combinations(parser: argparse.ArgumentParser, args: argparse.Namespac
         parser.error("bruteforce: --max-bit must be 0..7")
     if args.command in ("analyze", "bruteforce") and args.top < 1:
         parser.error(f"{args.command}: --top must be at least 1")
+    if args.command == "bitplanes":
+        # Same letters as bitplanes._grid_rows (case-insensitive, repeats
+        # allowed). Whether the image has an alpha channel is checked later.
+        if not args.channels or any(c not in "RGBA" for c in args.channels.upper()):
+            parser.error(f"bitplanes: --channels takes letters from RGBA, "
+                         f"got {args.channels!r}")
+    if getattr(args, "password", None) == "":
+        # payload.pack() treats an empty password as none, which would
+        # silently write a plaintext, unscattered frame (fail open).
+        parser.error(f"{args.command}: --password is empty (an unset shell variable?); "
+                     "give a password or use --password-prompt")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

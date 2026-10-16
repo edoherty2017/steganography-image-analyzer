@@ -375,3 +375,187 @@ def test_corrupt_wav(tmp_path):
 
 def test_clean_cover_has_nothing_to_decode(cover, tmp_path):
     assert_error(run_cli("decode", "-i", cover, cwd=tmp_path), contains="no STGA payload")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: legacy fallback gate, untrusted output, password and
+# exit-status contract, WAV word-list attack
+# ---------------------------------------------------------------------------
+
+def write_tone(path: Path, n_frames: int = 16000) -> Path:
+    """Write a mono 16-bit PCM WAV with a 440 Hz tone."""
+    t = np.arange(n_frames)
+    samples = (8000 * np.sin(2 * np.pi * 440 * t / 8000)).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(samples.tobytes())
+    return path
+
+
+def test_decode_refuses_legacy_noise_before_a_flat_region(synthetic_rgb, save_png, tmp_path):
+    """A clean image with a black border used to "decode" to kilobytes of noise, exit 0."""
+    arr = synthetic_rgb(5, size=128)
+    save_png(np.vstack([arr, np.zeros((24, 128, 3), np.uint8)]), "letterbox.png")
+    # Odd values on top, even below: the LSB stream is 0xFF bytes, then zeros.
+    saturated = np.vstack([arr[:64] | 1, arr[64:] & 0xFE])
+    save_png(saturated, "saturated.png")
+    for name in ("letterbox.png", "saturated.png"):
+        proc = run_cli("decode", "-i", name, cwd=tmp_path)
+        assert_error(proc, contains="no STGA payload")
+        assert "legacy delimiter format was not found" in proc.stderr
+        assert "are not text" in proc.stderr
+        assert proc.stdout == ""
+        # --legacy drops the score floor but still refuses data that is not text.
+        forced = run_cli("decode", "-i", name, "--legacy", cwd=tmp_path)
+        assert_error(forced, contains="no legacy-format message found")
+        assert forced.stdout == ""
+
+
+def test_decode_legacy_gate_keeps_short_messages(synthetic_rgb, save_png, tmp_path):
+    """The gate is bruteforce's legacy floor (0.15), not report's 0.5, so "hello" decodes."""
+    save_png(legacy_image(synthetic_rgb(9, size=128), b"hello"), "short.png")
+    proc = run_cli("decode", "-i", "short.png", cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "Decoded Message Found:\nhello\n"
+    assert "heuristic text score" in proc.stderr and "weak evidence" in proc.stderr
+
+    # Repetitive text (what smooth gradients put in an LSB plane) scores 0.05:
+    # refused by the automatic fallback, printed when --legacy asks for it.
+    save_png(legacy_image(synthetic_rgb(9, size=128), b"UUUUUUUUUUUU"), "rep.png")
+    assert_error(run_cli("decode", "-i", "rep.png", cwd=tmp_path),
+                 contains="does not look like a message")
+    forced = run_cli("decode", "-i", "rep.png", "--legacy", cwd=tmp_path)
+    assert forced.returncode == 0, forced.stderr
+    assert forced.stdout == "Decoded Message Found:\nUUUUUUUUUUUU\n"
+
+
+# Control characters a crafted payload could use against the analyst's
+# terminal: OSC window title (ESC ] ... BEL), clear screen, SGR colour, a
+# carriage return that overwrites the line, a C1 CSI and a right-to-left
+# override.
+_HOSTILE = "note \x1b]0;pwned-title\x07\x1b[2J\x1b[31mRED\x1b[0m\rfake line \x9b2J ‮end"
+_UNSAFE = ("\x1b", "\x07", "\r", "\x9b", "‮")
+
+
+def test_decode_does_not_echo_terminal_control_characters(cover, tmp_path, capsys):
+    """Run in-process: subprocess text mode would turn a raw \\r into \\n."""
+    import main
+
+    stego.hide(cover, tmp_path / "esc.png", _HOSTILE)
+    assert main.main(["decode", "-i", str(tmp_path / "esc.png")]) == 0
+    out, err = capsys.readouterr()
+    assert out.startswith("Decoded Message Found:\nnote ")
+    assert "RED" in out and "fake line" in out and "end" in out
+    for ch in _UNSAFE:
+        assert ch not in out
+    assert "control characters replaced" in err and "--out" in err
+    # --out still writes the exact bytes.
+    assert main.main(["decode", "-i", str(tmp_path / "esc.png"),
+                      "--out", str(tmp_path / "exact.txt")]) == 0
+    assert (tmp_path / "exact.txt").read_bytes() == _HOSTILE.encode("utf-8")
+    capsys.readouterr()
+
+    # A stored file name is untrusted too.
+    stego.hide(cover, tmp_path / "named.png", b"data", filename="evil\x1b[2J‮.txt")
+    assert main.main(["decode", "-i", str(tmp_path / "named.png")]) == 0
+    out, _ = capsys.readouterr()
+    assert "Hidden file found: 'evil" in out
+    for ch in _UNSAFE:
+        assert ch not in out
+
+
+def test_decode_legacy_text_is_sanitized_too(synthetic_rgb, save_png, tmp_path, capsys):
+    import main
+
+    # CR and RLO are printable to bruteforce's text heuristic, so this passes
+    # the legacy gate and must be cleaned when printed.
+    msg = "Account balance is fine\rHACKED: transfer approved ‮now"
+    save_png(legacy_image(synthetic_rgb(4, size=128), msg.encode("utf-8")), "cr.png")
+    assert main.main(["decode", "-i", str(tmp_path / "cr.png")]) == 0
+    out, _ = capsys.readouterr()
+    assert "HACKED: transfer approved" in out
+    for ch in _UNSAFE:
+        assert ch not in out
+    # ESC is not text at all, so a legacy reading containing it is refused.
+    save_png(legacy_image(synthetic_rgb(4, size=128), b"hello \x1b]0;pwned\x07 world"),
+             "esc_legacy.png")
+    assert main.main(["decode", "-i", str(tmp_path / "esc_legacy.png")]) == 1
+    out, err = capsys.readouterr()
+    assert out == "" and "\x1b" not in err
+
+
+def test_empty_password_is_a_usage_error(cover, tmp_path):
+    """--password "" used to write a plaintext, unscattered frame with exit 0."""
+    proc = run_cli("encode", "-i", cover, "-m", "secret", "-o", "o.png", "--password", "",
+                   cwd=tmp_path)
+    assert_error(proc, code=2, contains="--password is empty")
+    assert not (tmp_path / "o.png").exists()
+    for cmd in ("decode", "analyze"):
+        assert_error(run_cli(cmd, "-i", cover, "--password", "", cwd=tmp_path), code=2,
+                     contains="--password is empty")
+
+
+def test_bitplanes_bad_channels_is_a_usage_error(cover, tmp_path):
+    for channels in ("XYZ", "RGX", ""):
+        proc = run_cli("bitplanes", "-i", cover, "-o", "bp.png", "--channels", channels,
+                       cwd=tmp_path)
+        assert_error(proc, code=2, contains="--channels takes letters from RGBA")
+    assert not (tmp_path / "bp.png").exists()
+
+
+def test_bruteforce_wordlist_reaches_wav_carrier(tmp_path):
+    """The layout brute force opened the WAV with Pillow and failed first."""
+    write_tone(tmp_path / "tone.wav")
+    enc = run_cli("encode", "-i", "tone.wav", "-m", "audio secret", "-o", "secret.wav",
+                  "--password-prompt", cwd=tmp_path, input="correct horse\n")
+    assert enc.returncode == 0 and "encrypted, scattered" in enc.stdout
+    (tmp_path / "words.txt").write_text("password\ncorrect horse\n", encoding="utf-8")
+    (tmp_path / "nowords.txt").write_text("nope\n", encoding="utf-8")
+
+    proc = run_cli("bruteforce", "-i", "secret.wav", "--wordlist", "words.txt", cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "password 'correct horse'" in proc.stdout and "audio secret" in proc.stdout
+    assert "not an image" in proc.stderr
+
+    doc = json.loads(run_cli("bruteforce", "-i", "secret.wav", "--wordlist", "words.txt",
+                             "--json", cwd=tmp_path).stdout)
+    assert doc["candidates"] == []
+    assert [h["password"] for h in doc["wordlist_hits"]] == ["correct horse"]
+
+    saved = run_cli("bruteforce", "-i", "secret.wav", "--wordlist", "words.txt",
+                    "--save", "found", cwd=tmp_path)
+    assert saved.returncode == 0, saved.stderr
+    assert [p.read_bytes() for p in (tmp_path / "found").iterdir()] == [b"audio secret"]
+
+    assert_error(run_cli("bruteforce", "-i", "secret.wav", cwd=tmp_path),
+                 contains="--wordlist")
+    assert_error(run_cli("bruteforce", "-i", "secret.wav", "--wordlist", "nowords.txt",
+                         cwd=tmp_path), contains="no password in the word list matched")
+
+
+def test_bruteforce_wordlist_exit_status(cover, tmp_path):
+    """Exit 1 only when neither a password nor a layout found anything."""
+    (tmp_path / "nowords.txt").write_text("nope\n", encoding="utf-8")
+    (tmp_path / "words.txt").write_text("nope\nhunter2\n", encoding="utf-8")
+    assert run_cli("encode", "-i", cover, "-m", "scattered secret", "-o", "scat.png",
+                   "--password", "hunter2", cwd=tmp_path).returncode == 0
+
+    miss = run_cli("bruteforce", "-i", "scat.png", "--top", "1", "--wordlist", "nowords.txt",
+                   cwd=tmp_path)
+    assert_error(miss, contains="no password in the word list matched")
+    assert "wordlist: no password matched" in miss.stdout  # the table is still printed
+    hit = run_cli("bruteforce", "-i", "scat.png", "--top", "1", "--wordlist", "words.txt",
+                  cwd=tmp_path)
+    assert hit.returncode == 0 and "scattered secret" in hit.stdout
+
+    # An unscattered frame is found by the layouts (score 1.00), so a word
+    # list without the (unused) password is not "nothing found".
+    assert run_cli("encode", "-i", cover, "-m", "plain sequential message", "-o", "seq.png",
+                   cwd=tmp_path).returncode == 0
+    seq = run_cli("bruteforce", "-i", "seq.png", "--top", "1", "--wordlist", "nowords.txt",
+                  cwd=tmp_path)
+    assert seq.returncode == 0, seq.stderr
+    # Without --wordlist the brute force only ranks, so a clean cover exits 0.
+    assert run_cli("bruteforce", "-i", cover, "--top", "1", cwd=tmp_path).returncode == 0
