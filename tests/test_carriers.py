@@ -21,7 +21,14 @@ from carriers import (
     list_carriers,
     register,
 )
-from carriers.base import key_to_seed, scatter_order
+from carriers.base import (
+    SCATTER_SCRYPT_N,
+    SCATTER_SCRYPT_P,
+    SCATTER_SCRYPT_R,
+    content_salt,
+    key_to_seed,
+    scatter_order,
+)
 from carriers.image_lsb import ImageLSBCarrier
 from carriers.wav_lsb import WavLSBCarrier
 
@@ -199,20 +206,167 @@ def test_same_key_is_deterministic(synthetic_rgb):
     assert np.array_equal(a.rgb, b.rgb)
 
 
+def reference_salt(samples: np.ndarray) -> bytes:
+    """Independent copy of the documented salt: SHA-256 of the high bits."""
+    flat = np.asarray(samples).ravel()
+    high = (flat >> 2).astype(flat.dtype.newbyteorder("<"))
+    tag = f"{high.dtype.kind}{high.dtype.itemsize}".encode()
+    data = b"STGA-scatter-salt-v1" + tag + flat.size.to_bytes(8, "big") + high.tobytes()
+    return hashlib.sha256(data).digest()[:16]
+
+
+def reference_seed(key: str, salt: bytes) -> int:
+    """Independent copy of the documented seed: scrypt(key, salt), 8 bytes."""
+    out = hashlib.scrypt(key.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=8)
+    return int.from_bytes(out, "big")
+
+
 def test_scatter_order_matches_contract():
     key = "pässwörd"
-    n = 12345
-    seed = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big")
+    pixels = np.random.default_rng(5).integers(0, 256, (5, 823, 3), dtype=np.uint8)
+    n = pixels.size  # 12345 samples
+    salt = reference_salt(pixels)
+    seed = reference_seed(key, salt)
     expected = np.random.Generator(np.random.PCG64(seed)).permutation(n)
-    assert key_to_seed(key) == seed
-    assert np.array_equal(scatter_order(n, key), expected)
-    carrier = ImageLSBCarrier(np.zeros((5, 823, 3), dtype=np.uint8))  # 12345 samples
+
+    assert content_salt(pixels) == salt
+    assert key_to_seed(key, salt) == seed
+    assert np.array_equal(scatter_order(n, key, salt), expected)
+    carrier = ImageLSBCarrier(pixels)
+    assert carrier.scatter_salt() == salt
     assert np.array_equal(carrier.sample_order(key), expected)
+
+
+def test_scatter_seed_is_not_the_old_unsalted_hash():
+    # Regression: the seed used to be SHA-256(key)[:8], which let a password
+    # guess be checked without running scrypt. It must not come back.
+    key = "sunshine"
+    salt = reference_salt(np.zeros(100, dtype=np.uint8))
+    old_seed = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big")
+    assert key_to_seed(key, salt) != old_seed
 
 
 def test_no_key_and_empty_key_use_natural_order():
     assert np.array_equal(scatter_order(10), np.arange(10))
     assert np.array_equal(scatter_order(10, ""), np.arange(10))
+    assert np.array_equal(scatter_order(10, None, b"salt"), np.arange(10))
+
+
+def test_keyed_scatter_order_requires_a_salt():
+    with pytest.raises(ValueError, match="salt"):
+        scatter_order(10, "k")
+
+
+def test_scatter_kdf_cost_matches_payload_kdf():
+    # A guess through the scatter order must cost as much as a guess against
+    # the AES-GCM key, so the two scrypt cost settings have to agree.
+    payload = pytest.importorskip("payload")
+    assert (SCATTER_SCRYPT_N, SCATTER_SCRYPT_R, SCATTER_SCRYPT_P) == (
+        payload.SCRYPT_N, payload.SCRYPT_R, payload.SCRYPT_P)
+
+
+def test_every_password_guess_runs_scrypt_with_the_cover_salt(synthetic_rgb, monkeypatch):
+    # Regression for the offline password check: reading the scattered header
+    # for a guessed key must go through scrypt (memory-hard, payload cost
+    # settings) with this cover's salt, once per guess.
+    import carriers.base as base
+
+    calls = []
+    real_scrypt = hashlib.scrypt
+
+    def recording_scrypt(password, *, salt, n, r, p, maxmem=0, dklen=64):
+        calls.append({"password": password, "salt": salt, "n": n, "r": r, "p": p})
+        return real_scrypt(password, salt=salt, n=n, r=r, p=p, maxmem=maxmem, dklen=dklen)
+
+    monkeypatch.setattr(base.hashlib, "scrypt", recording_scrypt)
+    carrier = ImageLSBCarrier(synthetic_rgb(10, size=64))
+    salt = reference_salt(carrier.rgb)
+    guesses = ["123456", "password", "letmein"]
+    for guess in guesses:
+        carrier.extract(112, key=guess)
+        carrier.extract(1000, key=guess)  # header then frame: no second scrypt
+
+    assert [c["password"] for c in calls] == [g.encode() for g in guesses]
+    for call in calls:
+        assert call["salt"] == salt
+        assert (call["n"], call["r"], call["p"]) == (2 ** 14, 8, 1)
+
+
+def test_same_size_covers_get_different_orders_for_the_same_key(synthetic_rgb):
+    # Regression: the order used to depend only on (key, number of samples),
+    # so one precomputed table per image size served every stego file of that
+    # size. Two covers of the same size must now get unrelated orders.
+    a = ImageLSBCarrier(synthetic_rgb(1, size=64))
+    b = ImageLSBCarrier(synthetic_rgb(2, size=64))
+    assert a.num_samples() == b.num_samples()
+    assert a.scatter_salt() != b.scatter_salt()
+    order_a = a.sample_order("shared password")
+    order_b = b.sample_order("shared password")
+    assert np.mean(order_a[:1000] == order_b[:1000]) < 0.01
+
+
+def test_salt_survives_embedding_at_both_depths_and_saving(tmp_path, synthetic_rgb):
+    # The extractor recomputes the salt from the stego file, so embedding
+    # (which changes only the two lowest bits) must leave it unchanged.
+    cover = synthetic_rgb(11, size=64)
+    carrier = ImageLSBCarrier(cover, bits_per_sample=2)
+    salt = carrier.scatter_salt()
+    order = carrier.sample_order("k").copy()
+    bits = random_bits(carrier.capacity_bits(), seed=3)  # every low bit rewritten
+    carrier.embed(bits, key="k")
+    assert carrier.scatter_salt() == salt
+    carrier.bits_per_sample = 1
+    assert carrier.scatter_salt() == salt
+
+    out = tmp_path / "full.png"
+    carrier.save(out)
+    reloaded = ImageLSBCarrier.load(out, bits_per_sample=2)
+    assert reloaded.scatter_salt() == salt
+    assert np.array_equal(reloaded.sample_order("k"), order)
+    assert np.array_equal(reloaded.extract(len(bits), key="k"), bits)
+
+
+def test_order_cache_follows_the_cover_content(synthetic_rgb):
+    # The cached order is reused only while the salt (the high bits) is the
+    # same; changing a high bit gives a new salt and a new order.
+    carrier = ImageLSBCarrier(synthetic_rgb(12, size=32))
+    before = carrier.sample_order("k").copy()
+    assert carrier.sample_order("k") is carrier.sample_order("k")
+    carrier.rgb[0, 0, 0] ^= 0x80
+    after = carrier.sample_order("k")
+    assert not np.array_equal(before, after)
+
+
+def test_wav_salt_is_endian_independent():
+    # 16-bit WAV samples are hashed as little-endian, so the salt (and thus a
+    # keyed order) does not depend on the machine's byte order.
+    samples = np.arange(-500, 500, dtype=np.int16)
+    assert content_salt(samples.astype("<i2")) == content_salt(samples.astype(">i2"))
+    assert content_salt(samples) == reference_salt(samples)
+
+
+def test_scattered_header_not_found_through_unsalted_hash(tmp_path, synthetic_rgb, save_png):
+    # End-to-end form of the reported attack: hide with a password (which
+    # is also the scatter key), then try to find the header the old cheap
+    # way, with the order seeded from SHA-256(password) and no scrypt.
+    stego = pytest.importorskip("stego")
+    payload = pytest.importorskip("payload")
+    from bitutils import bits_to_bytes
+
+    cover = save_png(synthetic_rgb(13), "cover.png")
+    out = tmp_path / "s.png"
+    stego.hide(cover, out, "top secret", password="sunshine")
+
+    samples = ImageLSBCarrier.load(out)._samples()
+    old_seed = int.from_bytes(hashlib.sha256(b"sunshine").digest()[:8], "big")
+    old_order = np.random.Generator(np.random.PCG64(old_seed)).permutation(samples.size)
+    old_header = bits_to_bytes((samples[old_order[:112]] & 1).astype(np.uint8))
+    assert old_header[:4] != payload.MAGIC
+
+    # The salted scrypt order (what reveal() uses) still finds it.
+    carrier = ImageLSBCarrier.load(out)
+    assert carrier.extract_bytes(4, key="sunshine") == payload.MAGIC
+    assert stego.reveal(out, password="sunshine").text() == "top secret"
 
 
 @pytest.mark.parametrize("bps", [1, 2])
@@ -294,6 +448,143 @@ def test_grayscale_cover_converted(tmp_path, synthetic_rgb, mode):
     assert np.array_equal(carrier.rgb[..., 2], gray)
     if mode == "LA":
         assert (carrier.alpha == 77).all()
+
+
+def gradient16(size: int = 128) -> np.ndarray:
+    """A smooth 0..65535 horizontal gradient, the shape of a 16-bit scan."""
+    return np.tile(np.linspace(0, 65535, size), (size, 1)).astype(np.uint16)
+
+
+@pytest.mark.parametrize("ext", [".png", ".tif"])
+def test_16bit_grayscale_cover_is_scaled_not_clipped(tmp_path, ext):
+    # Regression: convert("RGB") clipped I;16 values at 255, so the cover
+    # (and the stego image) came out ~99% white.
+    grad = gradient16()
+    Image.fromarray(grad).save(tmp_path / f"g16{ext}")
+    with Image.open(tmp_path / f"g16{ext}") as img:
+        assert img.mode.startswith("I;16")
+    carrier = ImageLSBCarrier.load(tmp_path / f"g16{ext}")
+    assert carrier.mode == "RGB"
+    for c in range(3):
+        assert np.array_equal(carrier.rgb[..., c], (grad >> 8).astype(np.uint8))
+    assert (carrier.rgb == 255).mean() < 0.02
+
+
+def test_16bit_grayscale_stego_end_to_end(tmp_path):
+    import stego
+
+    grad = gradient16()
+    Image.fromarray(grad).save(tmp_path / "g16.png")
+    stego.hide(tmp_path / "g16.png", tmp_path / "out.png", "sixteen bit")
+    with Image.open(tmp_path / "out.png") as img:
+        assert img.mode == "RGB"
+        out = np.array(img)
+    assert (out == 255).mean() < 0.02  # was 0.99 before the fix
+    expected = (grad >> 8).astype(np.uint8)
+    for c in range(3):
+        assert np.array_equal(out[..., c] >> 1, expected >> 1)  # only LSBs differ
+    assert stego.reveal(tmp_path / "out.png").text() == "sixteen bit"
+
+
+def test_16bit_pgm_cover_opened_as_I_is_scaled(tmp_path):
+    grad = gradient16(64)
+    Image.fromarray(grad).save(tmp_path / "g16.pgm")
+    with Image.open(tmp_path / "g16.pgm") as img:
+        mode = img.mode
+    assert mode in ("I", "I;16")  # Pillow 12 opens 16-bit PGM as "I"
+    carrier = ImageLSBCarrier.load(tmp_path / "g16.pgm")
+    assert np.array_equal(carrier.rgb[..., 0], (grad >> 8).astype(np.uint8))
+
+
+@pytest.mark.parametrize("values, expected", [
+    # "I" values that fit in a byte are used as they are.
+    (np.array([[0, 17, 255]], np.int32), [0, 17, 255]),
+    # "I" values up to 65535 are treated as 16-bit data.
+    (np.array([[0, 4096, 65535]], np.int32), [0, 16, 255]),
+    # Anything else is stretched from min..max to 0..255.
+    (np.array([[-1000, 0, 1000]], np.int32), [0, 128, 255]),
+    (np.array([[0, 100000, 200000]], np.int32), [0, 128, 255]),
+    # "F" in 0..1 is a normalised float image.
+    (np.array([[0.0, 0.5, 1.0]], np.float32), [0, 128, 255]),
+    # "F" in 0..255 is used as is (rounded); NaN counts as 0.
+    (np.array([[2.4, 200.6, np.nan]], np.float32), [2, 201, 0]),
+])
+def test_I_and_F_modes_scaled_to_8bit(values, expected):
+    img = Image.fromarray(values)
+    assert img.mode in ("I", "F")
+    carrier = ImageLSBCarrier.from_image(img)
+    assert carrier.mode == "RGB"
+    for c in range(3):
+        assert carrier.rgb[0, :, c].tolist() == expected
+
+
+def test_16bit_grayscale_transparency_key_becomes_alpha(tmp_path):
+    grad = gradient16(32)
+    key = int(grad[0, 5])
+    Image.fromarray(grad).save(tmp_path / "g16t.png", transparency=key)
+    carrier = ImageLSBCarrier.load(tmp_path / "g16t.png")
+    assert carrier.mode == "RGBA"
+    assert np.array_equal(carrier.alpha == 0, grad == key)
+    assert np.array_equal(carrier.rgb[..., 0], (grad >> 8).astype(np.uint8))
+
+
+def colour_keyed_rgb_png(path, synthetic_rgb, mode="RGB"):
+    """Save a cover whose top-left 8x8 block is a tRNS colour key."""
+    arr = synthetic_rgb(16, size=64)
+    if mode == "RGB":
+        arr[:8, :8] = (0, 255, 0)
+        Image.fromarray(arr).save(path, transparency=(0, 255, 0))
+        mask = (arr == (0, 255, 0)).all(axis=-1)
+    else:
+        arr = arr[..., 0].copy()
+        arr[:8, :8] = 7
+        Image.fromarray(arr, "L").save(path, transparency=7)
+        mask = arr == 7  # other pixels may share the key value
+    assert mask[:8, :8].all()
+    return arr, mask
+
+
+@pytest.mark.parametrize("mode", ["RGB", "L"])
+def test_colour_key_transparency_becomes_rgba(tmp_path, synthetic_rgb, mode):
+    # Regression: RGB images took an early return and lost their tRNS key.
+    path = tmp_path / "keyed.png"
+    _, mask = colour_keyed_rgb_png(path, synthetic_rgb, mode)
+    carrier = ImageLSBCarrier.load(path)
+    assert carrier.mode == "RGBA"
+    with Image.open(path) as img:
+        assert img.mode == mode
+        expected = np.array(img.convert("RGBA"))
+    assert np.array_equal(carrier.pixels, expected)
+    assert np.array_equal(carrier.alpha == 0, mask)
+
+
+def test_colour_key_transparency_survives_hide(tmp_path, synthetic_rgb):
+    import stego
+
+    path = tmp_path / "keyed.png"
+    _, mask = colour_keyed_rgb_png(path, synthetic_rgb)
+    # Fill the cover so the keyed pixels' LSBs certainly change; the alpha
+    # channel must still mark exactly the originally transparent pixels.
+    room = stego.capacity_bytes(path)
+    stego.hide(path, tmp_path / "out.png", b"\xa5" * room)
+    with Image.open(tmp_path / "out.png") as img:
+        assert img.mode == "RGBA"
+        alpha = np.array(img)[..., 3]
+    assert np.array_equal(alpha == 0, mask)
+    assert (alpha[~mask] == 255).all()
+    assert stego.reveal(tmp_path / "out.png").data == b"\xa5" * room
+
+
+def test_image_to_array_matches_load(tmp_path, synthetic_rgb):
+    from carriers.image_lsb import image_to_array
+
+    Image.fromarray(gradient16(32)).save(tmp_path / "g16.png")
+    _, _ = colour_keyed_rgb_png(tmp_path / "keyed.png", synthetic_rgb)
+    for name in ("g16.png", "keyed.png"):
+        with Image.open(tmp_path / name) as img:
+            arr = image_to_array(img)
+        assert arr.dtype == np.uint8 and arr.flags.writeable
+        assert np.array_equal(arr, ImageLSBCarrier.load(tmp_path / name).pixels)
 
 
 def test_jpeg_cover_accepted_but_jpeg_output_refused(tmp_path, synthetic_rgb):
@@ -417,6 +708,115 @@ def test_wav_rejects_lossy_and_unsupported(tmp_path):
     write_wav(tmp_path / "c24.wav", np.zeros(300, dtype=np.uint8), sampwidth=3, nchannels=1)
     with pytest.raises(ValueError, match="24-bit"):
         WavLSBCarrier.load(tmp_path / "c24.wav")
+
+
+def write_truncated_wav(tmp_path, samples, *, sampwidth, nchannels, cut, name="trunc.wav"):
+    """Write a WAV, then rewrite it without its last ``cut`` bytes."""
+    full = tmp_path / ("full-" + name)
+    write_wav(full, samples, sampwidth=sampwidth, nchannels=nchannels)
+    raw = full.read_bytes()
+    path = tmp_path / name
+    path.write_bytes(raw[:-cut])
+    return path
+
+
+# (sampwidth, nchannels, frames written, bytes cut, whole frames left)
+TRUNCATIONS = [
+    (2, 1, 1001, 1, 1000),  # 16-bit mono cut mid-sample (odd byte count)
+    (2, 2, 1001, 3, 1000),  # 16-bit stereo cut mid-sample: drop the whole frame
+    (2, 2, 1001, 2, 1000),  # 16-bit stereo cut between the two channels
+    (1, 2, 1001, 1, 1000),  # 8-bit stereo cut between the two channels
+    (2, 1, 1001, 2, 1000),  # cut on a frame boundary: header still says 1001
+]
+
+
+@pytest.mark.parametrize("sampwidth,nchannels,n_frames,cut,left", TRUNCATIONS)
+@pytest.mark.parametrize("bps", [1, 2])
+def test_wav_truncated_data_drops_partial_frame(tmp_path, sampwidth, nchannels, n_frames,
+                                                cut, left, bps):
+    # Regression: a file cut off mid-sample used to fail in np.frombuffer with
+    # "buffer size must be a multiple of element size".
+    if sampwidth == 2:
+        samples = sine_16bit(n_frames, nchannels)
+    else:
+        samples = np.tile(sine_8bit(n_frames)[:, None], (1, nchannels)).reshape(-1)
+    path = write_truncated_wav(tmp_path, samples, sampwidth=sampwidth,
+                               nchannels=nchannels, cut=cut)
+
+    carrier = WavLSBCarrier.load(path, bits_per_sample=bps)
+    assert carrier.params.nframes == left
+    assert carrier.samples.size == left * nchannels
+    assert np.array_equal(carrier.samples, samples[:left * nchannels])
+    assert carrier.capacity_bits() == left * nchannels * bps
+
+    # The truncated file still works as a cover: embed, save, reload, extract.
+    bits = random_bits(carrier.capacity_bits(), seed=11)
+    carrier.embed(bits, key="cut-key")
+    carrier.save(tmp_path / "stego.wav")
+    with wave.open(str(tmp_path / "stego.wav")) as w:
+        assert w.getnframes() == left
+        assert (w.getnchannels(), w.getsampwidth()) == (nchannels, sampwidth)
+    reloaded = WavLSBCarrier.load(tmp_path / "stego.wav", bits_per_sample=bps)
+    assert reloaded.params == carrier.params
+    assert np.array_equal(reloaded.extract(len(bits), key="cut-key"), bits)
+
+
+@pytest.mark.parametrize("password", [None, "pw"])
+def test_truncated_wav_stego_still_reveals(tmp_path, password):
+    # End to end through the high-level API named in the bug report: a stego
+    # WAV that loses its last byte still reports a capacity and still gives
+    # back a payload hidden in samples before the cut. Key scatter is off
+    # because its permutation depends on the sample count, so a keyed payload
+    # cannot be located once the file is shorter than when it was written.
+    import payload
+    import stego
+
+    write_wav(tmp_path / "cover.wav", sine_16bit(4000, 2), sampwidth=2, nchannels=2)
+    stego.hide(tmp_path / "cover.wav", tmp_path / "stego.wav", "survives the cut",
+               password=password, key_scatter=False)
+    raw = (tmp_path / "stego.wav").read_bytes()
+    cut = tmp_path / "cut.wav"
+    cut.write_bytes(raw[:-1])
+
+    # 3999 whole stereo frames are left: 7998 one-bit samples.
+    assert stego.capacity_bytes(cut) == 7998 // 8 - payload.HEADER_LEN
+    assert stego.reveal(cut, password=password).text() == "survives the cut"
+
+
+def test_wav_shorter_than_one_frame_has_zero_capacity(tmp_path):
+    # Data chunk holds a single byte of a 4-byte stereo frame.
+    path = write_truncated_wav(tmp_path, sine_16bit(2, 2), sampwidth=2, nchannels=2, cut=7)
+    carrier = WavLSBCarrier.load(path)
+    assert carrier.samples.size == 0
+    assert carrier.params.nframes == 0
+    assert carrier.capacity_bits() == 0
+    with pytest.raises(CapacityError):
+        carrier.embed(random_bits(1))
+
+
+@pytest.mark.parametrize("keep", [0, 4, 20, 30])
+def test_wav_truncated_header_raises_clear_wave_error(tmp_path, keep):
+    # Regression: a file cut inside the RIFF or fmt chunk header made the
+    # stdlib raise a bare EOFError (empty message), which the CLI does not
+    # catch; it is now a wave.Error that says the file is truncated.
+    write_wav(tmp_path / "full.wav", sine_16bit(100, 1), sampwidth=2, nchannels=1)
+    path = tmp_path / "cut.wav"
+    path.write_bytes((tmp_path / "full.wav").read_bytes()[:keep])
+    with pytest.raises(wave.Error, match="truncated WAV"):
+        WavLSBCarrier.load(path)
+
+
+def test_wav_any_header_truncation_is_a_wave_error(tmp_path):
+    # Every cut inside the 44-byte canonical header raises wave.Error (some
+    # cuts get the stdlib's own message, e.g. "data chunk missing"), never
+    # EOFError, so the CLI and GUI handlers for wave.Error always apply.
+    write_wav(tmp_path / "full.wav", sine_16bit(100, 1), sampwidth=2, nchannels=1)
+    raw = (tmp_path / "full.wav").read_bytes()
+    path = tmp_path / "cut.wav"
+    for keep in range(44):
+        path.write_bytes(raw[:keep])
+        with pytest.raises(wave.Error):
+            WavLSBCarrier.load(path)
 
 
 # --- registry ----------------------------------------------------------------

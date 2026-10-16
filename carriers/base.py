@@ -40,18 +40,40 @@ Bit layout:
       into bit 0 (higher bit first).
     * Without a key, samples are used in their natural order (0, 1, 2, ...).
     * With a key, the order is ``rng.permutation(num_samples)`` where
-      ``rng = numpy.random.Generator(numpy.random.PCG64(seed))`` and ``seed``
-      is the first 8 bytes of ``sha256(key.encode("utf-8"))`` read as a
-      big-endian integer. The payload is then spread over the whole cover
-      instead of packed into its first rows. That hides it from a simple
-      look at the top rows of the LSB plane and weakens the original
-      chi-square attack of Westfeld & Pfitzmann (1999), which scans for a
-      sequentially embedded region; it does not help against whole-image
-      statistics (sample pair or RS analysis) and makes no difference at
-      full capacity. It is an obfuscation step, not encryption: anyone who
-      knows the key (or the password it came from) can follow the order.
-      Every prefix of the order is stable, so reading the first 112 bits and
+      ``rng = numpy.random.Generator(numpy.random.PCG64(seed))``. The seed
+      comes from a key derivation function, not a plain hash: it is the
+      8-byte big-endian output of ``scrypt(key, salt, n=2**14, r=8, p=1)``
+      (the same cost parameters payload.py uses for the encryption key), and
+      ``salt`` is a 16-byte digest of the carrier's own samples with their
+      two lowest bits shifted away (see content_salt()). Embedding changes
+      only those two bits, so the cover and the stego file give the same
+      salt and nothing extra has to be stored in the carrier.
+    * The payload is then spread over the whole cover instead of packed into
+      its first rows. That hides it from a simple look at the top rows of
+      the LSB plane and weakens the original chi-square attack of Westfeld &
+      Pfitzmann (1999), which scans for a sequentially embedded region; it
+      does not help against whole-image statistics (sample pair or RS
+      analysis) and makes no difference at full capacity. It is an
+      obfuscation step, not encryption: anyone who knows the key (or the
+      password it came from) can follow the order.
+    * Every prefix of the order is stable, so reading the first 112 bits and
       then the whole frame with the same key gives consistent results.
+
+Why the seed goes through scrypt with a per-cover salt. stego.py uses the
+payload password as the scatter key. If the seed were a bare hash of the key
+(as in an earlier version: the first 8 bytes of SHA-256(key)), a password
+guess could be checked by permuting, reading the 112 header bits and looking
+for ``b"STGA"``. That check never runs the memory-hard scrypt that protects
+the AES key (measured at roughly 18 times cheaper per guess on a 256x256
+cover), and because the
+order depended only on (key, number of samples), one table of orders per
+image size served every stego file of that size. With the salted scrypt seed
+each guess costs one scrypt evaluation for that particular cover, the same
+as a guess against the encryption, and two different covers of the same size
+get different orders for the same key. The salt is not secret (anyone can
+recompute it from the file); it only makes the work per file. Weak passwords
+stay weak: this removes the shortcut, it does not add strength. Reusing the
+same cover with the same key gives the same order.
 """
 from __future__ import annotations
 
@@ -84,34 +106,113 @@ class CapacityError(ValueError):
     """Raised when more bits are requested than the carrier can hold."""
 
 
-def key_to_seed(key: str | bytes) -> int:
-    """Derive the 64-bit scatter seed from a key.
+# Key derivation for the scatter seed. The scrypt cost matches payload.py's
+# encryption key (SCRYPT_N, SCRYPT_R, SCRYPT_P there), so checking a password
+# guess through the scatter order is no cheaper than checking it against the
+# AES-GCM key. Changing any of these changes every keyed order, which makes
+# files hidden with the old values unreadable.
+SCATTER_SCRYPT_N = 2 ** 14
+SCATTER_SCRYPT_R = 8
+SCATTER_SCRYPT_P = 1
+# scrypt needs 128 * r * n * p bytes (16 MiB here); allow headroom so builds
+# with a small default memory limit still accept these parameters.
+_SCATTER_SCRYPT_MAXMEM = 64 * 1024 * 1024
+SCATTER_SALT_LEN = 16
+# Domain tag hashed in front of the samples, so the salt cannot collide with
+# a digest of the same bytes made for any other purpose.
+_SALT_DOMAIN = b"STGA-scatter-salt-v1"
+# Embedding changes at most the two lowest bits of a sample
+# (bits_per_sample is 1 or 2); the salt only looks at the bits above them.
+_SALT_SHIFT = 2
+
+
+def content_salt(samples: np.ndarray) -> bytes:
+    """Derive the per-cover scatter salt from a carrier's samples.
+
+    The digest covers every sample with its two lowest bits shifted away.
+    embed() only ever changes those two bits (at 1 or 2 bits per sample),
+    so a cover and any stego file made from it give the same salt, and
+    reveal() can recompute it without the salt being stored anywhere.
+    Samples are hashed as little-endian integers of their own width, so the
+    salt is the same on every platform.
+
+    Args:
+        samples: The carrier samples (any integer dtype, any shape; they are
+            read in C order).
+
+    Returns:
+        bytes: ``SCATTER_SALT_LEN`` bytes, the start of
+        SHA-256(domain tag | dtype | sample count | high bits of the samples).
+    """
+    arr = np.asarray(samples).ravel()
+    high = arr >> _SALT_SHIFT  # arithmetic shift, so signed samples work too
+    canonical = np.ascontiguousarray(high.astype(high.dtype.newbyteorder("<"), copy=False))
+    digest = hashlib.sha256(_SALT_DOMAIN)
+    digest.update(f"{canonical.dtype.kind}{canonical.dtype.itemsize}".encode("ascii"))
+    digest.update(int(arr.size).to_bytes(8, "big"))
+    digest.update(canonical.view(np.uint8))
+    return digest.digest()[:SCATTER_SALT_LEN]
+
+
+def key_to_seed(key: str | bytes, salt: bytes) -> int:
+    """Derive the 64-bit scatter seed from a key and a per-cover salt.
+
+    Uses scrypt (memory-hard, ``n=2**14, r=8, p=1``) rather than a plain
+    hash, so testing one password guess against the scatter order costs as
+    much as testing it against the payload's encryption key.
 
     Args:
         key: The scatter key, usually the payload password. ``str`` keys are
             encoded as UTF-8.
+        salt: The carrier's salt, normally content_salt() of its samples.
 
     Returns:
-        int: The first 8 bytes of SHA-256(key) as a big-endian unsigned int.
+        int: The 8-byte scrypt output read as a big-endian unsigned int.
     """
     raw = key.encode("utf-8") if isinstance(key, str) else bytes(key)
-    return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
+    derived = hashlib.scrypt(
+        raw,
+        salt=bytes(salt),
+        n=SCATTER_SCRYPT_N,
+        r=SCATTER_SCRYPT_R,
+        p=SCATTER_SCRYPT_P,
+        maxmem=_SCATTER_SCRYPT_MAXMEM,
+        dklen=8,
+    )
+    return int.from_bytes(derived, "big")
 
 
-def scatter_order(n_samples: int, key: str | bytes | None = None) -> np.ndarray:
+def scatter_order(
+    n_samples: int,
+    key: str | bytes | None = None,
+    salt: bytes | None = None,
+) -> np.ndarray:
     """Return the order in which samples are used for ``n_samples`` samples.
+
+    Most callers want Carrier.sample_order(key), which supplies the salt
+    from the carrier's own samples.
 
     Args:
         n_samples: Number of samples in the carrier.
         key: Scatter key. ``None`` or an empty string means natural order.
+        salt: The carrier's salt (content_salt() of its samples). Required
+            when ``key`` is given.
 
     Returns:
         np.ndarray: A 1-D ``int64`` array that is a permutation of
         ``range(n_samples)``.
+
+    Raises:
+        ValueError: If ``key`` is given without a ``salt``.
     """
     if not key:
         return np.arange(n_samples, dtype=np.int64)
-    rng = np.random.Generator(np.random.PCG64(key_to_seed(key)))
+    if salt is None:
+        raise ValueError(
+            "a keyed scatter order needs the carrier's salt; pass "
+            "salt=content_salt(samples) or use Carrier.sample_order(key)"
+        )
+    rng = np.random.Generator(np.random.PCG64(key_to_seed(key, salt)))
     return rng.permutation(n_samples)
 
 
@@ -155,9 +256,10 @@ class Carrier(abc.ABC):
 
     def __init__(self, bits_per_sample: int = 1) -> None:
         self.bits_per_sample = bits_per_sample
-        # (key, n_samples, order) of the last keyed order, so reading a header
-        # and then the full frame with the same key permutes only once.
-        self._order_cache: tuple[str | bytes, int, np.ndarray] | None = None
+        # (key, n_samples, salt, order) of the last keyed order, so reading a
+        # header and then the full frame with the same key runs scrypt and
+        # the permutation only once.
+        self._order_cache: tuple[str | bytes, int, bytes, np.ndarray] | None = None
 
     # ------------------------------------------------------------------
     # Methods a subclass provides
@@ -242,19 +344,31 @@ class Carrier(abc.ABC):
         """Maximum number of payload bits this carrier can hold."""
         return self.num_samples() * self.bits_per_sample
 
+    def scatter_salt(self) -> bytes:
+        """Return this carrier's scatter salt (content_salt() of its samples).
+
+        It does not change when bits are embedded, so the cover and the
+        stego file give the same value.
+        """
+        return content_salt(self._samples())
+
     def sample_order(self, key: str | bytes | None = None) -> np.ndarray:
         """Return the sample visiting order for ``key`` (see scatter_order()).
 
-        Keyed orders are cached per key on the instance.
+        The salt is recomputed from the samples on every call (a hash of the
+        samples, cheap next to the permutation); the scrypt seed and the
+        permutation are cached on the instance for the last (key, salt).
         """
         n = self.num_samples()
         if not key:
             return np.arange(n, dtype=np.int64)
+        salt = self.scatter_salt()
         cached = self._order_cache
-        if cached is not None and cached[0] == key and cached[1] == n:
-            return cached[2]
-        order = scatter_order(n, key)
-        self._order_cache = (key, n, order)
+        if (cached is not None and cached[0] == key and cached[1] == n
+                and cached[2] == salt):
+            return cached[3]
+        order = scatter_order(n, key, salt)
+        self._order_cache = (key, n, salt, order)
         return order
 
     def _positions(self, n_used: int, key: str | bytes | None) -> np.ndarray:

@@ -191,6 +191,32 @@ def _locate(
     return None
 
 
+def _check_output_for_carrier(carrier: Carrier, out: Path) -> None:
+    """Refuse an output path that this loaded cover cannot be saved to.
+
+    Carrier.check_output_path() only looks at the extension, so it can run
+    before the cover is read. One refusal also depends on the cover: BMP
+    cannot round-trip an alpha channel through Pillow, so ImageLSBCarrier
+    refuses ``.bmp`` for a cover with alpha. The carrier only finds that
+    out inside save(), after the frame is built (scrypt), embedded and the
+    output folder is created. This mirrors the rule from
+    carriers/image_lsb.py so hide() can refuse right after loading. The
+    carrier keeps its own check as well.
+
+    Args:
+        carrier: The loaded cover.
+        out: The output path, already accepted by check_output_path().
+
+    Raises:
+        LossyFormatError: If ``out`` is a ``.bmp`` file (any case) and the
+            carrier has an alpha channel.
+    """
+    if out.suffix.lower() == ".bmp" and getattr(carrier, "alpha", None) is not None:
+        raise LossyFormatError(
+            "BMP output would drop this image's alpha channel; save as .png or .tiff"
+        )
+
+
 def _no_payload_message(path: str | os.PathLike, password: str | None,
                         bits: int | None) -> str:
     """Build the NoPayloadError message for reveal()."""
@@ -269,8 +295,10 @@ def hide(
     """Hide ``data`` in a cover file and write the stego file.
 
     Steps: pick the carrier from the cover's extension, refuse a lossy
-    output extension before doing any work, load the cover, build the frame
-    with payload.pack(), check that it fits, embed its bits, save.
+    output extension before doing any work, load the cover, refuse an
+    output format that cannot hold this cover (``.bmp`` for a cover with
+    alpha), build the frame with payload.pack(), check that it fits, embed
+    its bits, create missing output folders, save.
 
     Args:
         cover_path: The cover. Any format its carrier can read; for images
@@ -278,7 +306,8 @@ def hide(
             read. The file itself is never modified.
         output_path: Where to write the stego file. Its extension must be a
             lossless output format of the same carrier (.png, .bmp, .tif or
-            .tiff for images, .wav for audio). Missing parent folders are
+            .tiff for images, .wav for audio); .bmp only for covers without
+            an alpha channel. Missing parent folders are
             created and an existing file is overwritten.
         data: The bytes to hide; a str is encoded as UTF-8.
         password: If non-empty, encrypt the payload (AES-256-GCM, scrypt
@@ -304,9 +333,12 @@ def hide(
 
     Raises:
         LossyFormatError: If ``output_path`` has a lossy or unsupported
-            extension for this carrier (nothing is written).
+            extension for this carrier, or is ``.bmp`` for an image cover
+            with an alpha channel (BMP would drop the alpha). Raised before
+            the frame is built, so nothing is written and no folder is
+            created.
         CapacityError: If the frame does not fit in the cover (nothing is
-            written).
+            written and no folder is created).
         ValueError: If no carrier handles the cover's extension, ``bits`` is
             not 1 or 2, or the file name is unusable.
         TypeError: If ``data`` is not bytes-like or str.
@@ -316,6 +348,9 @@ def hide(
     # Fail fast on .jpg and friends before reading the cover or running scrypt.
     out = cls.check_output_path(output_path)
     carrier = cls.load(cover_path, bits_per_sample=bits)
+    # Some refusals depend on the loaded cover (BMP cannot keep alpha); make
+    # them before scrypt, embedding and creating the output folder.
+    _check_output_for_carrier(carrier, out)
 
     frame = payload.pack(data, password=password, filename=filename,
                          compress=compress)

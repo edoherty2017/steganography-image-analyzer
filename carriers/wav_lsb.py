@@ -15,6 +15,14 @@ module and NumPy are used, so there are no audio dependencies. All WAV
 parameters (channels, sample width, frame rate, frame count) are written back
 unchanged.
 
+Truncated files (an interrupted download or recording) are handled as
+follows. If the audio data stops part-way through a frame, the trailing
+partial frame is dropped and the whole frames before it are used, so the
+file still works as a cover (and a payload hidden before the cut can still
+be read). The frame count is then taken from the data actually present, not
+from the header, which still declares the original length. If the file is
+cut off inside the header itself, load() raises ``wave.Error`` saying so.
+
 This carrier is the proof that the ``Carrier`` interface is not image
 specific: the same embed/extract/scatter code from ``carriers/base.py``
 works on audio unchanged.
@@ -72,6 +80,10 @@ class WavLSBCarrier(Carrier):
     def load(cls, path: str | os.PathLike, bits_per_sample: int = 1) -> "WavLSBCarrier":
         """Read a PCM WAV file as a cover.
 
+        If the audio data ends part-way through a frame (a truncated file),
+        the trailing partial frame is dropped and ``params.nframes`` is set
+        to the number of whole frames actually read.
+
         Args:
             path: The ``.wav`` file.
             bits_per_sample: Low bits used per sample, 1 or 2.
@@ -81,16 +93,36 @@ class WavLSBCarrier(Carrier):
 
         Raises:
             ValueError: For sample widths other than 8 or 16 bits.
-            wave.Error: If the file is not a PCM WAV file.
+            wave.Error: If the file is not a PCM WAV file, or is truncated
+                inside its header.
         """
-        with wave.open(os.fspath(path), "rb") as w:
-            params = w.getparams()
-            if params.sampwidth not in _DTYPES:
-                raise ValueError(
-                    f"unsupported WAV sample width: {params.sampwidth * 8}-bit "
-                    "(only 8-bit and 16-bit PCM are supported)"
-                )
-            frames = w.readframes(params.nframes)
+        try:
+            with wave.open(os.fspath(path), "rb") as w:
+                params = w.getparams()
+                if params.sampwidth not in _DTYPES:
+                    raise ValueError(
+                        f"unsupported WAV sample width: {params.sampwidth * 8}-bit "
+                        "(only 8-bit and 16-bit PCM are supported)"
+                    )
+                frames = w.readframes(params.nframes)
+        except EOFError as exc:
+            # The stdlib raises a bare EOFError (no message) when the RIFF
+            # header or a chunk header is cut short. Callers already handle
+            # wave.Error for unreadable WAV files, so report it as one.
+            raise wave.Error(
+                "truncated WAV file: it ends inside the header, before the audio data"
+            ) from exc
+        # A file cut off mid-sample or mid-frame returns a byte count that is
+        # not a whole number of frames, and np.frombuffer would fail with an
+        # unhelpful "buffer size must be a multiple of element size". Keep the
+        # whole frames (not just whole samples, so stereo channels stay
+        # aligned) and record how many there really are; the header's nframes
+        # still states the original, untruncated length.
+        frame_size = params.sampwidth * params.nchannels
+        whole = len(frames) - len(frames) % frame_size
+        if whole != len(frames) or whole // frame_size != params.nframes:
+            frames = frames[:whole]
+            params = params._replace(nframes=whole // frame_size)
         # frombuffer returns a read-only view of the bytes; __init__ copies it.
         samples = np.frombuffer(frames, dtype=_DTYPES[params.sampwidth])
         return cls(samples, params, bits_per_sample=bits_per_sample)

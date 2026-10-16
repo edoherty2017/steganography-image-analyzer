@@ -315,6 +315,39 @@ def test_rgba_cover_keeps_alpha(tmp_path, synthetic_rgb):
     assert stego.reveal(out).text() == MESSAGE
 
 
+@pytest.mark.parametrize("ext", [".bmp", ".BMP"])
+def test_rgba_cover_to_bmp_fails_before_any_work(tmp_path, synthetic_rgb, monkeypatch, ext):
+    """BMP cannot keep alpha; hide() must refuse before scrypt or mkdir.
+
+    Regression: the refusal used to come only from the carrier's save(),
+    after payload.pack() (scrypt) and embedding had run and the missing
+    output folder had been created.
+    """
+    rgb = synthetic_rgb(2, size=32)
+    alpha = np.full((32, 32), 200, dtype=np.uint8)
+    src = save_image(np.dstack([rgb, alpha]), tmp_path / "ca.png")
+    out = tmp_path / "sub" / f"o{ext}"
+
+    def no_pack(*args, **kwargs):
+        raise AssertionError("payload.pack() ran before the BMP/alpha refusal")
+
+    with monkeypatch.context() as m:
+        m.setattr(payload, "pack", no_pack)
+        with pytest.raises(LossyFormatError, match="alpha"):
+            stego.hide(src, out, "hello", password="pw")
+    assert not out.exists()
+    assert not out.parent.exists()
+
+    # Positive controls: the same cover still saves losslessly as TIFF, and
+    # an RGB cover still saves as BMP.
+    tif = tmp_path / "ok" / "o.tif"
+    stego.hide(src, tif, "hello", password="pw")
+    assert stego.reveal(tif, password="pw").text() == "hello"
+    bmp = tmp_path / "ok" / "rgb.bmp"
+    stego.hide(save_image(rgb, tmp_path / "c.png"), bmp, "hello")
+    assert stego.reveal(bmp).text() == "hello"
+
+
 def test_unsupported_cover_extension(tmp_path):
     bogus = tmp_path / "cover.xyz"
     bogus.write_bytes(b"not an image")

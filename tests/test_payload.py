@@ -38,18 +38,37 @@ def _flip_byte(frame: bytes, index: int) -> bytes:
     return bytes(out)
 
 
-def _reframe(flags: int, body: bytes) -> bytes:
+def _crc(prefix: bytes, body: bytes) -> int:
+    """Frame CRC computed independently of payload.py: header bytes 0-9 + body."""
+    return zlib.crc32(prefix + body) & 0xFFFFFFFF
+
+
+def _reframe(flags: int, body: bytes, version: int = VERSION) -> bytes:
     """Build a frame with a valid header and CRC around an arbitrary body."""
-    crc = zlib.crc32(body) & 0xFFFFFFFF
-    return struct.pack(">4sBBII", MAGIC, VERSION, flags, len(body), crc) + body
+    prefix = struct.pack(">4sBBI", MAGIC, version, flags, len(body))
+    return prefix + struct.pack(">I", _crc(prefix, body)) + body
+
+
+def _set_flags(frame: bytes, flags: int, *, fix_crc: bool) -> bytes:
+    """Rewrite the flags byte, optionally recomputing the CRC to match.
+
+    Without fix_crc this models accidental damage (or a naive edit); with it,
+    a deliberate attacker who knows the format.
+    """
+    out = bytearray(frame)
+    out[5] = flags
+    if fix_crc:
+        out[10:14] = struct.pack(">I", _crc(bytes(out[:10]), bytes(out[HEADER_LEN:])))
+    return bytes(out)
 
 
 # --- Constants and error classes ------------------------------------------
 
 def test_contract_constants():
     assert MAGIC == b"STGA"
-    assert VERSION == 1
+    assert VERSION == 2
     assert HEADER_LEN == 14
+    assert payload.HEADER_PREFIX_LEN == 10
     assert (FLAG_ENCRYPTED, FLAG_FILE, FLAG_COMPRESSED) == (0x01, 0x02, 0x04)
 
 
@@ -331,9 +350,165 @@ def test_truncated_compressed_body_raises():
 
 
 def test_decompression_limit(monkeypatch):
+    frame = pack(b"\x00" * 5000, compress=True)
     monkeypatch.setattr(payload, "MAX_DECOMPRESSED_LEN", 1000)
     with pytest.raises(PayloadError, match="inflates"):
-        unpack(pack(b"\x00" * 5000, compress=True))
+        unpack(frame)
+
+
+def test_decompression_cap_is_small():
+    # Regression: the cap was 256 MiB, so a ~255 KB zlib bomb hidden in a
+    # 2 MB PNG made every decode allocate ~850 MB. A few MiB is plenty.
+    assert payload.MAX_DECOMPRESSED_LEN <= 16 * 1024 * 1024
+
+
+def test_zip_bomb_just_past_default_cap_is_rejected():
+    cap = payload.MAX_DECOMPRESSED_LEN
+    bomb = zlib.compress(b"\x00" * (cap + 1), 9)
+    assert len(bomb) < cap // 500  # a tiny frame...
+    with pytest.raises(PayloadError, match="inflates past"):
+        unpack(_reframe(FLAG_COMPRESSED, bomb))  # ...that is refused
+
+
+def test_record_exactly_at_cap_is_accepted(monkeypatch):
+    monkeypatch.setattr(payload, "MAX_DECOMPRESSED_LEN", 4096)
+    data = os.urandom(4096)
+    assert unpack(pack(data, compress=True)).data == data
+
+
+def test_max_decompressed_len_argument():
+    frame = pack(b"A" * 5000, compress=True)
+    with pytest.raises(PayloadError, match="inflates past 4999"):
+        unpack(frame, max_decompressed_len=4999)
+    assert unpack(frame, max_decompressed_len=5000).data == b"A" * 5000
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_max_decompressed_len_must_be_positive(bad):
+    # zlib treats max_length=0 as "unlimited", so 0 must not reach it.
+    with pytest.raises(ValueError):
+        unpack(pack(b"x", compress=True), max_decompressed_len=bad)
+
+
+def test_pack_refuses_to_compress_past_the_cap(monkeypatch):
+    # A frame that unpack() would refuse must not be written in the first place.
+    monkeypatch.setattr(payload, "MAX_DECOMPRESSED_LEN", 1000)
+    with pytest.raises(ValueError, match="without compression"):
+        pack(b"x" * 1001, compress=True)
+    # The file name counts: it is part of the compressed record.
+    with pytest.raises(ValueError, match="without compression"):
+        pack(b"x" * 995, filename="ab.txt", compress=True)
+    assert pack(b"x" * 5000).startswith(MAGIC)  # uncompressed is unaffected
+
+
+# --- Header integrity (the flags byte) -------------------------------------
+# Regression: the CRC used to cover only the body and GCM had no associated
+# data, so clearing a flag bit silently changed how the body was decoded.
+
+@pytest.mark.parametrize(
+    "kwargs, flag",
+    [
+        ({"password": PASSWORD}, FLAG_ENCRYPTED),
+        ({"password": PASSWORD, "compress": True}, FLAG_COMPRESSED),
+        ({"compress": True}, FLAG_COMPRESSED),
+        ({"password": PASSWORD, "filename": "report.pdf"}, FLAG_FILE),
+        ({"filename": "report.pdf"}, FLAG_FILE),
+    ],
+)
+def test_cleared_flag_bit_fails_crc(kwargs, flag):
+    frame = pack(b"PDFDATA attack at dawn", **kwargs)
+    flags = parse_header(frame)[0]
+    assert flags & flag
+    tampered = _set_flags(frame, flags & ~flag, fix_crc=False)
+    with pytest.raises(PayloadError, match="CRC") as info:
+        unpack(tampered, password=kwargs.get("password"))
+    assert not isinstance(info.value, WrongPasswordError)
+    with pytest.raises(PayloadError, match="CRC"):
+        unpack(tampered)
+
+
+@pytest.mark.parametrize("bit", [FLAG_ENCRYPTED, FLAG_FILE, FLAG_COMPRESSED])
+def test_set_flag_bit_fails_crc(bit):
+    frame = pack(b"plain message")
+    with pytest.raises(PayloadError, match="CRC"):
+        unpack(_set_flags(frame, bit, fix_crc=False), password=PASSWORD)
+
+
+def test_body_len_is_covered_by_crc():
+    # Shrinking body_len by one and recomputing a body-only CRC (the old
+    # rule) must not yield a shorter, "valid" payload.
+    frame = bytearray(pack(b"hello world"))
+    body_len = struct.unpack(">I", frame[6:10])[0] - 1
+    frame[6:10] = struct.pack(">I", body_len)
+    body = bytes(frame[HEADER_LEN:HEADER_LEN + body_len])
+    frame[10:14] = struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+    with pytest.raises(PayloadError, match="CRC"):
+        unpack(bytes(frame))
+
+
+@pytest.mark.parametrize(
+    "kwargs, flag",
+    [
+        ({"compress": True}, FLAG_COMPRESSED),
+        ({"filename": "report.pdf"}, FLAG_FILE),
+        ({"filename": "report.pdf", "compress": True}, FLAG_COMPRESSED),
+    ],
+)
+def test_encrypted_header_is_gcm_associated_data(kwargs, flag):
+    # An attacker who also recomputes the CRC still cannot change how an
+    # encrypted frame is decoded: the header prefix is bound to the GCM tag.
+    frame = pack(b"PDFDATA", password=PASSWORD, **kwargs)
+    flags = parse_header(frame)[0]
+    tampered = _set_flags(frame, flags & ~flag, fix_crc=True)
+    with pytest.raises(WrongPasswordError):
+        unpack(tampered, password=PASSWORD)
+
+
+def test_clearing_encrypted_flag_never_reveals_plaintext():
+    # Documented limit: with the CRC recomputed, a frame stripped of
+    # FLAG_ENCRYPTED unpacks as unencrypted, but only to the ciphertext.
+    frame = pack(b"attack at dawn", password=PASSWORD)
+    tampered = _set_flags(frame, 0, fix_crc=True)
+    result = unpack(tampered)
+    assert result.encrypted is False
+    assert b"attack at dawn" not in result.data
+    assert result.data == frame[HEADER_LEN:]
+
+
+def test_version_1_frame_is_rejected():
+    # v1 frames (body-only CRC, no associated data) are no longer accepted.
+    body = b"old format"
+    v1 = (struct.pack(">4sBBII", MAGIC, 1, 0, len(body), zlib.crc32(body) & 0xFFFFFFFF)
+          + body)
+    with pytest.raises(PayloadError, match="version"):
+        parse_header(v1)
+    with pytest.raises(PayloadError, match="version"):
+        unpack(v1)
+
+
+def test_flipped_flags_lsb_in_stego_image_is_detected(tmp_path, synthetic_rgb, save_png):
+    # End-to-end form of the regression: one flipped LSB in the flags byte
+    # of a stego PNG must raise instead of returning the raw zlib stream.
+    import numpy as np
+    from PIL import Image
+
+    import stego
+
+    cover = save_png(synthetic_rgb(3), "cover.png")
+    out = tmp_path / "stego.png"
+    stego.hide(cover, out, "meet at noon", compress=True)
+    assert stego.reveal(out).text() == "meet at noon"
+
+    arr = np.array(Image.open(out))
+    flat = arr[:, :, :3].reshape(-1)
+    flat[5 * 8 + 5] ^= 1  # flags byte, bit 0x04 (FLAG_COMPRESSED), MSB first
+    damaged = arr.copy()
+    damaged[:, :, :3] = flat.reshape(arr[:, :, :3].shape)
+    bad = tmp_path / "damaged.png"
+    Image.fromarray(damaged).save(bad)
+
+    with pytest.raises(PayloadError, match="CRC"):
+        stego.reveal(bad)
 
 
 @pytest.mark.parametrize(
@@ -371,7 +546,7 @@ def test_header_and_frame_len_consistent(kwargs):
     assert parse_header(frame) == (flags, body_len, crc)
     assert frame_len(header) == len(frame) == HEADER_LEN + body_len
     assert frame_len(frame) == len(frame)
-    assert crc == zlib.crc32(frame[HEADER_LEN:]) & 0xFFFFFFFF
+    assert crc == _crc(frame[:10], frame[HEADER_LEN:])
     # Reading exactly frame_len bytes is enough to decode, as stego.reveal does.
     result = unpack(frame[:frame_len(header)], password=kwargs.get("password"))
     assert result.data == data
@@ -383,5 +558,5 @@ def test_header_layout_is_big_endian():
     assert frame[4] == VERSION
     assert frame[5] == 0
     assert frame[6:10] == (3).to_bytes(4, "big")
-    assert frame[10:14] == (zlib.crc32(b"abc") & 0xFFFFFFFF).to_bytes(4, "big")
+    assert frame[10:14] == (zlib.crc32(frame[:10] + b"abc") & 0xFFFFFFFF).to_bytes(4, "big")
     assert frame[14:] == b"abc"
